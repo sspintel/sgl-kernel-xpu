@@ -105,6 +105,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_grouped_mm_nt_xe35(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
   m.impl("moe_grouped_mm_nt_xe35", torch::kXPU, &moe_grouped_mm_nt_xe35);
+  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
 #endif
 
 // Xe40 only kernels
