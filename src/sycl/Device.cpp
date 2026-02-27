@@ -17,7 +17,8 @@ std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
     case syclex::architecture::intel_gpu_bmg_g21:
     case syclex::architecture::intel_gpu_bmg_g31:
       return std::make_tuple(2, 0);
-    // more arch is coming soon
+    case syclex::architecture::intel_gpu_jgs:
+      return std::make_tuple(4, 0);
     default:
       throw std::runtime_error("Unsupported XPU architecture.");
   }
