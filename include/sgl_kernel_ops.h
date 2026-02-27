@@ -676,6 +676,7 @@ void moe_grouped_mm_nt_xe35(
     const int64_t activation_type = 0,  // 0=silu, 1=gelu
     bool fuse_act = false);
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 #endif
 
 // Xe40 only kernels
