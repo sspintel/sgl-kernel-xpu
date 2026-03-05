@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from .utils import is_xe2_arch
+from .utils import is_xe2_arch, is_xe3_arch
 
 
 def moe_align_block_size(
@@ -461,6 +461,15 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
+    if is_xe2_arch():
+        if use_mxfp4_w4a16:
+            moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16
+        else:
+            moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20
+    elif is_xe3_arch():
+        assert use_mxfp4_w4a16 is False, "MXFP4 W4A16 is not supported on Xe3"
+        moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35
+
     # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
     # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).
     if activation == "silu":
@@ -494,7 +503,7 @@ def fused_experts(
     else:
         raise ValueError(f"Unsupported activation {activation}")
 
-    if is_xe2_arch():
+    if is_xe2_arch() or is_xe3_arch():
         # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
         # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
         # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
@@ -520,7 +529,7 @@ def fused_experts(
             )
             # GEMM1: B = w1 (gate+up).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -534,7 +543,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -570,7 +579,7 @@ def fused_experts(
                 intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
             # GEMM2: B = w2 (down).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache2,
                     w2,
@@ -584,7 +593,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache2,
                     w2,
@@ -602,7 +611,7 @@ def fused_experts(
             )
             # GEMM1 (fused act): B = w1 (gate+up).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -616,7 +625,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -630,7 +639,7 @@ def fused_experts(
                 )
             # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache1,
                     w2,
@@ -644,7 +653,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                torch.ops.sgl_kernel.moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache1,
                     w2,

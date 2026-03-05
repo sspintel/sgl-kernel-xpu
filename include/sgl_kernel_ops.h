@@ -322,41 +322,6 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
-void moe_grouped_mm_nt_xe40(
-    torch::Tensor& output,
-    const torch::Tensor& activations,
-    const torch::Tensor& weights,
-    const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts);
-
-void moe_grouped_mm_nt_xe20(
-    torch::Tensor& output,
-    const torch::Tensor& activations,
-    const torch::Tensor& weights,
-    const std::optional<at::Tensor>& bias,
-    const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts,
-    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
-    bool fuse_act = false,
-    double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
-
-// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
-// with two E2M1 nibbles per byte (low nibble = smaller-K element).
-// `scales` is float32 direct-multiplier, one per 32-element K-block.
-void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
-    torch::Tensor& output,
-    const torch::Tensor& activations,
-    const torch::Tensor& packed_weights,
-    const torch::Tensor& scales,
-    const std::optional<at::Tensor>& bias,
-    const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts,
-    const int64_t activation_type = 0,
-    bool fuse_act = false,
-    double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
-
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
@@ -664,3 +629,60 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+
+/*
+ * Device-specific kernel declarations
+ */
+// Xe20 only kernels
+#if SYCL_INTEL_TARGET == 20
+void moe_grouped_mm_nt_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
+// with two E2M1 nibbles per byte (low nibble = smaller-K element).
+// `scales` is float32 direct-multiplier, one per 32-element K-block.
+void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+#endif
+
+// Xe35 only kernels
+#if SYCL_INTEL_TARGET == 35
+void moe_grouped_mm_nt_xe35(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu
+    bool fuse_act = false);
+#endif
+
+// Xe40 only kernels
+#if SYCL_INTEL_TARGET == 40
+void moe_grouped_mm_nt_xe40(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+#endif
