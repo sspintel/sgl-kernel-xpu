@@ -1,6 +1,6 @@
 #define SYCL_INTEL_TARGET 35
 
-#include "kernels/moe/xe20/GroupGemm.hpp"
+#include "../kernels/moe/xe20/GroupGemm.hpp"
 
 void moe_grouped_mm_nt_xe35(
     torch::Tensor& output,
