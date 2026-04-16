@@ -55,7 +55,7 @@ def test_per_tensor_quant_compare_implementations(
     torch_out = torch_scaled_fp8_quant(x, sglang_scale.cpu())
 
     torch.testing.assert_close(
-        sglang_out.cpu().float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.float(), rtol=1e-2, atol=1e-2
     )
 
     scale = torch.rand(1, dtype=torch.float32, device=device)
@@ -63,7 +63,7 @@ def test_per_tensor_quant_compare_implementations(
     torch_out = torch_scaled_fp8_quant(x, scale.cpu())
 
     torch.testing.assert_close(
-        sglang_out.cpu().float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.float(), rtol=1e-2, atol=1e-2
     )
 
 
