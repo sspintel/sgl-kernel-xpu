@@ -5,6 +5,7 @@ import os
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401 - required to register torch.ops.sgl_kernel.* custom ops
 import torch
 import torch.nn.functional as F
 import utils
