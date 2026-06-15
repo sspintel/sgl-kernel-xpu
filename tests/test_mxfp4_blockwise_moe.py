@@ -203,78 +203,61 @@ def prepare_kernel_inputs(
     scales_b_list: list,
     device: str,
 ):
+    """Flat-2D inputs + empty-ptr sentinels for on-device prep. Uniform m."""
     num_experts = len(a_list)
-
     m, packed_k = a_list[0].shape
     k = packed_k * 2
     n_b, packed_k_b = b_list[0].shape
-    k_b = packed_k_b * 2
+    assert k == packed_k_b * 2
     n = n_b
-    assert k == k_b
+    total_m = num_experts * m
 
-    a_stack = torch.stack(
+    a_flat = torch.cat(
         [ensure_contiguous_layout(a) for a in a_list], dim=0
     ).contiguous()
+    sa_flat = torch.cat(
+        [ensure_contiguous_layout(s) for s in scales_a_list], dim=0
+    ).contiguous()
+    assert a_flat.shape == (total_m, packed_k)
+    assert sa_flat.shape == (total_m, k // MXFP4_BLOCK_SIZE)
+
     b_stack = torch.stack(
         [ensure_contiguous_layout(b) for b in b_list], dim=0
     ).contiguous()
-    scales_a_stack = torch.stack(
-        [ensure_contiguous_layout(s.t().contiguous()) for s in scales_a_list], dim=0
-    ).contiguous()
-    scales_b_stack = torch.stack(
-        [ensure_contiguous_layout(s.t().contiguous()) for s in scales_b_list], dim=0
+    sb_stack = torch.stack(
+        [ensure_contiguous_layout(s) for s in scales_b_list], dim=0
     ).contiguous()
 
-    output = torch.zeros((num_experts, m, n), dtype=torch.float32, device=device)
-
-    a_ptrs = torch.tensor(
-        [a_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    b_ptrs = torch.tensor(
-        [b_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    out_ptrs = torch.tensor(
-        [output[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    a_scales_ptrs = torch.tensor(
-        [scales_a_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    b_scales_ptrs = torch.tensor(
-        [scales_b_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-
-    problem_sizes = torch.tensor(
-        [[m, n, k] for _ in range(num_experts)], dtype=torch.int32, device=device
-    )
-    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-
-    workspace = torch.empty((1024 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+    expert_offsets = torch.arange(0, total_m, m, dtype=torch.int32, device=device)
+    empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
 
     return {
         "output": output,
-        "a_ptrs": a_ptrs,
-        "b_ptrs": b_ptrs,
-        "out_ptrs": out_ptrs,
-        "a_scales_ptrs": a_scales_ptrs,
-        "b_scales_ptrs": b_scales_ptrs,
-        "a_stack": a_stack,
+        "a_ptrs": empty_ptrs,
+        "b_ptrs": empty_ptrs,
+        "out_ptrs": empty_ptrs,
+        "a_scales_ptrs": empty_ptrs,
+        "b_scales_ptrs": empty_ptrs,
+        "a_stack": a_flat,
         "b_stack": b_stack,
-        "scales_a_stack": scales_a_stack,
-        "scales_b_stack": scales_b_stack,
-        "problem_sizes": problem_sizes,
+        "scales_a_stack": sa_flat,
+        "scales_b_stack": sb_stack,
+        "problem_sizes": torch.tensor(
+            [[m, n, k]] * num_experts, dtype=torch.int32, device=device
+        ),
         "expert_offsets": expert_offsets,
-        "workspace": workspace,
+        # 64 MiB sized for these tests; 1 GiB legacy can fragment device pool.
+        "workspace": torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device),
+        "_per_expert_m": m,
+        "_num_experts": num_experts,
     }
+
+
+def _expert_slice(inputs, i):
+    """Slice expert i's (m, n) output from flat (sum_m_i, n) buffer."""
+    m = inputs["_per_expert_m"]
+    return inputs["output"][i * m : (i + 1) * m]
 
 
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
@@ -345,7 +328,7 @@ class TestMXFP4BlockwiseScaledGroupedMM:
         )
 
         for i in range(num_experts):
-            kernel_out = inputs["output"][i].to("cpu")
+            kernel_out = _expert_slice(inputs, i).to("cpu")
             ref_out = ref_outputs[i].to("cpu")
 
             assert not torch.isnan(kernel_out).any()
@@ -411,10 +394,104 @@ class TestMXFP4BlockwiseScaledGroupedMM:
             inputs["workspace"],
         )
 
-        kernel_out = inputs["output"][0].to("cpu")
+        kernel_out = _expert_slice(inputs, 0).to("cpu")
         kernel_mean = kernel_out.mean()
         ref_mean = actual_ref.mean()
 
         assert 4.0 < kernel_mean < 8.0
         assert 4.0 < ref_mean < 8.0
         assert abs(kernel_mean - ref_mean) < 1.0
+
+
+# Ragged-M (varying m_i per expert) — flat-2D layout with expert_offsets.
+# Catches per-expert A-scale M-stride bug when scale_cols > 1.
+
+
+@pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
+@pytest.mark.skipif(
+    is_xpu_available() and not is_cri_device(),
+    reason="MXFP4 blockwise scaled grouped GEMM requires a CRI (Xe3P) device",
+)
+class TestMXFP4RaggedM:
+    """Ragged-M tests: per-expert m_i varies, flat-2D layout."""
+
+    @pytest.fixture(autouse=True)
+    def check_kernel_available(self):
+        skip_if_no_xpu()
+        if not is_cri_device():
+            pytest.skip(
+                "MXFP4 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
+            )
+
+    @torch.inference_mode()
+    def test_flat_2d_ragged_distribution(self):
+        """k=64 (scale_cols=2) exercises per-expert A-scale M-stride."""
+        from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
+
+        device = "xpu"
+        n, k = 64, 64
+        m_per_expert = [32, 64, 96, 64]
+        num_experts = len(m_per_expert)
+        total_m = sum(m_per_expert)
+        packed_k = k // 2
+        scale_cols = k // MXFP4_BLOCK_SIZE
+
+        a_flat = torch.zeros((total_m, packed_k), dtype=torch.uint8, device=device)
+        sa_flat = torch.zeros((total_m, scale_cols), dtype=torch.uint8, device=device)
+        b_list, sb_list, ref_outputs = [], [], []
+
+        expert_offsets_h = []
+        row = 0
+        for e, m_i in enumerate(m_per_expert):
+            expert_offsets_h.append(row)
+            a_q, sa, _ = create_random_mxfp4_data(m_i, k, "cpu", seed=42 + e)
+            b_q, sb, _ = create_random_mxfp4_data(n, k, "cpu", seed=100 + e)
+
+            a_flat[row : row + m_i] = a_q.to(device)
+            sa_flat[row : row + m_i] = sa.to(device)
+            b_list.append(b_q.to(device).contiguous())
+            sb_list.append(sb.to(device).contiguous())
+
+            a_dq = dequantize_mxfp4(a_q.cpu(), sa.cpu(), torch.float32)
+            b_dq = dequantize_mxfp4(b_q.cpu(), sb.cpu(), torch.float32)
+            ref_outputs.append(torch.matmul(a_dq, b_dq.t()))
+            row += m_i
+
+        b_stack = torch.stack(b_list).contiguous()
+        sb_stack = torch.stack(sb_list).contiguous()
+        output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+        empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
+        problem_sizes = torch.tensor(
+            [[m_i, n, k] for m_i in m_per_expert],
+            dtype=torch.int32,
+            device=device,
+        )
+        expert_offsets = torch.tensor(
+            expert_offsets_h, dtype=torch.int32, device=device
+        )
+        workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
+
+        mxfp4_blockwise_scaled_grouped_mm(
+            output,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            a_flat,
+            b_stack,
+            sa_flat,
+            sb_stack,
+            problem_sizes,
+            expert_offsets,
+            workspace,
+        )
+
+        row = 0
+        for e, m_i in enumerate(m_per_expert):
+            kernel_out = output[row : row + m_i].cpu()
+            ref_out = ref_outputs[e]
+            assert not torch.isnan(kernel_out).any(), f"Expert {e}: NaN"
+            assert kernel_out.shape == ref_out.shape
+            torch.testing.assert_close(kernel_out, ref_out, atol=1e-1, rtol=1e-1)
+            row += m_i

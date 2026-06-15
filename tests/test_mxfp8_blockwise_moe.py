@@ -199,43 +199,53 @@ def prepare_kernel_inputs(
     scales_b_list: list,
     device: str,
 ):
-    """Stack per-expert tensors and build pointer / metadata arrays for the kernel."""
+    """Build flat-2D inputs for fp8_blockwise_scaled_grouped_mm with on-device
+    prep. A and A-scales are concatenated into (sum_m_i, ...) tensors;
+    expert_offsets locates each expert's row range. B and B-scales stay 3D
+    (uniform per expert). The empty int64 sentinel tensors signal the C++
+    entry point to build the {5, E} pointer table and transpose A-scales on
+    device via a single SYCL launch.
+    """
     num_experts = len(a_list)
+    # Uniform per-expert m for these tests (ragged is covered separately).
     m, k = a_list[0].shape
     n, k_b = b_list[0].shape
     assert k == k_b
+    total_m = num_experts * m
 
-    a_stack = torch.stack([ensure_contiguous(a) for a in a_list]).contiguous()
+    # Flat-2D A and A-scales.
+    a_flat = torch.cat([ensure_contiguous(a) for a in a_list], dim=0).contiguous()
+    sa_flat = torch.cat(
+        [ensure_contiguous(s) for s in scales_a_list], dim=0
+    ).contiguous()
+    assert a_flat.shape == (total_m, k)
+    assert sa_flat.shape == (total_m, k // MXFP8_BLOCK_SIZE)
+
+    # B and scales_b stay 3D per expert.
     b_stack = torch.stack([ensure_contiguous(b) for b in b_list]).contiguous()
-    # Transpose A scales from row-major (M, K//128) to column-major (K//128, M)
-    # to match the kernel's StrideScaleA = Stride<_1, M, 0> expectation.
-    scales_a_stack = torch.stack(
-        [ensure_contiguous(s.t().contiguous()) for s in scales_a_list]
-    ).contiguous()
-    scales_b_stack = torch.stack(
-        [ensure_contiguous(s) for s in scales_b_list]
-    ).contiguous()
+    sb_stack = torch.stack([ensure_contiguous(s) for s in scales_b_list]).contiguous()
 
-    output = torch.zeros((num_experts, m, n), dtype=torch.float32, device=device)
+    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
 
-    def _ptrs(t):
-        return torch.tensor(
-            [t[i].data_ptr() for i in range(num_experts)],
-            dtype=torch.uint64,
-            device=device,
-        )
+    # Cumulative per-expert start offsets (in rows). For uniform m, this is
+    # [0, m, 2m, 3m, ...].
+    expert_offsets = torch.arange(0, total_m, m, dtype=torch.int32, device=device)
+
+    # Empty int64 sentinel tensors: signals the C++ entry point to build the
+    # {5, E} pointer table on device via a single SYCL launch.
+    empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
 
     return {
         "output": output,
-        "a_ptrs": _ptrs(a_stack),
-        "b_ptrs": _ptrs(b_stack),
-        "out_ptrs": _ptrs(output),
-        "a_scales_ptrs": _ptrs(scales_a_stack),
-        "b_scales_ptrs": _ptrs(scales_b_stack),
-        "a_stack": a_stack,
+        "a_ptrs": empty_ptrs,
+        "b_ptrs": empty_ptrs,
+        "out_ptrs": empty_ptrs,
+        "a_scales_ptrs": empty_ptrs,
+        "b_scales_ptrs": empty_ptrs,
+        "a_stack": a_flat,
         "b_stack": b_stack,
-        "scales_a_stack": scales_a_stack,
-        "scales_b_stack": scales_b_stack,
+        "scales_a_stack": sa_flat,
+        "scales_b_stack": sb_stack,
         "stride_a": torch.full((num_experts,), k, dtype=torch.int64, device=device),
         "stride_b": torch.full((num_experts,), k, dtype=torch.int64, device=device),
         "stride_c": torch.full((num_experts,), n, dtype=torch.int64, device=device),
@@ -244,10 +254,12 @@ def prepare_kernel_inputs(
         "problem_sizes": torch.tensor(
             [[m, n, k]] * num_experts, dtype=torch.int32, device=device
         ),
-        "expert_offsets": torch.arange(num_experts, dtype=torch.int32, device=device),
-        "workspace": torch.empty(
-            (1024 * 1024 * 1024,), dtype=torch.uint8, device=device
-        ),
+        "expert_offsets": expert_offsets,
+        # 64 MiB is enough for shapes used by these tests; the legacy 1 GiB
+        # allocation can hit device-pool fragmentation under sequential runs.
+        "workspace": torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device),
+        "_per_expert_m": m,
+        "_num_experts": num_experts,
     }
 
 
@@ -276,6 +288,13 @@ def _call_kernel(inputs):
         inputs["expert_offsets"],
         inputs["workspace"],
     )
+
+
+def _expert_slice(inputs, i):
+    """Return expert i's (m, n) output slice from the flat (sum_m_i, n) buffer.
+    For uniform-m fixtures only; ragged-m tests use their own indexing."""
+    m = inputs["_per_expert_m"]
+    return inputs["output"][i * m : (i + 1) * m]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +352,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         _call_kernel(inputs)
 
         for i in range(num_experts):
-            kernel_out = inputs["output"][i].cpu()
+            kernel_out = _expert_slice(inputs, i).cpu()
             ref_out = ref_outputs[i].cpu()
 
             assert not torch.isnan(kernel_out).any(), f"Expert {i}: NaN"
@@ -372,7 +391,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         )
         _call_kernel(inputs)
 
-        kernel_out = inputs["output"][0].cpu()
+        kernel_out = _expert_slice(inputs, 0).cpu()
         assert not torch.isnan(kernel_out).any()
         assert not torch.isinf(kernel_out).any()
 
@@ -407,7 +426,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         )
         _call_kernel(inputs)
 
-        kernel_out = inputs["output"][0].cpu()
+        kernel_out = _expert_slice(inputs, 0).cpu()
         assert not torch.isnan(kernel_out).any()
         assert not torch.isinf(kernel_out).any()
         torch.testing.assert_close(kernel_out, ref_out, atol=0.5, rtol=0.15)
@@ -442,7 +461,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         _call_kernel(inputs)
 
         for i in range(num_experts):
-            kernel_out = inputs["output"][i].cpu()
+            kernel_out = _expert_slice(inputs, i).cpu()
             ref_out = ref_outputs[i].cpu()
             assert not torch.isnan(kernel_out).any()
             torch.testing.assert_close(kernel_out, ref_out, atol=2.0, rtol=0.2)
@@ -563,3 +582,122 @@ class TestMXFP8BlockwiseScaledGroupedMM:
                 torch.tensor([0], dtype=torch.int32, device=device),
                 torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
             )
+
+
+# ---------------------------------------------------------------------------
+# Ragged-M (varying m_i per expert) — practical fused-MoE shapes
+#
+# When T tokens are routed with topk=k, each token replicates k times and
+# lands on (potentially) k different experts. The per-expert token counts
+# m_0, m_1, ..., m_{E-1} satisfy Σ m_i = T*k and are *not* equal in general.
+# The kernel API takes flat 2D A of shape (sum_m_i, K) with per-expert row
+# ranges located via expert_offsets; problem_sizes[e][0] = m_i carries the
+# real per-expert count.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
+@pytest.mark.skipif(
+    is_xpu_available() and not is_cri_device(),
+    reason="MXFP8 blockwise scaled grouped GEMM requires a CRI (Xe3P) device",
+)
+class TestMXFP8RaggedM:
+    """Ragged-M tests: per-expert m_i varies (the practical fused-MoE shape).
+    Verifies the kernel honors problem_sizes[e][0] when A/scales/output are
+    stored as flat 2D tensors with per-expert ranges via expert_offsets[]."""
+
+    @pytest.fixture(autouse=True)
+    def check_kernel_available(self):
+        skip_if_no_xpu()
+        if not is_cri_device():
+            pytest.skip(
+                "MXFP8 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
+            )
+
+    @torch.inference_mode()
+    def test_flat_2d_ragged_distribution(self):
+        """Flat-2D layout: A / scales_a / output stored as (sum_m_i, ...) with
+        per-expert row ranges located via expert_offsets. This is the layout
+        sglang's cutlass_fused_experts_fp8 produces after shuffle_rows. B and
+        scales_b stay 3D per-expert. Uses k=256 so scale_cols=2."""
+        device = "xpu"
+        n, k = 128, 256
+        m_per_expert = [128, 256, 384, 256]  # ragged
+        num_experts = len(m_per_expert)
+        total_m = sum(m_per_expert)
+        scale_cols = k // MXFP8_BLOCK_SIZE
+
+        # Flat A and flat scales_a; per-expert rows packed back-to-back.
+        a_flat = torch.zeros((total_m, k), dtype=torch.float8_e4m3fn, device=device)
+        sa_flat = torch.zeros((total_m, scale_cols), dtype=torch.float32, device=device)
+        b_list, sb_list, ref_outputs = [], [], []
+
+        expert_offsets_h = []
+        row = 0
+        for e, m_i in enumerate(m_per_expert):
+            expert_offsets_h.append(row)
+            a_q, sa, _ = create_random_mxfp8_data(m_i, k, "cpu", seed=42 + e)
+            b_q, sb = _create_b_quantized(n, k, seed=100 + e)
+
+            a_flat[row : row + m_i] = ensure_contiguous(a_q).to(device)
+            sa_flat[row : row + m_i] = ensure_contiguous(sa).to(device)
+            b_list.append(ensure_contiguous(b_q).to(device))
+            sb_list.append(ensure_contiguous(sb).to(device))
+
+            a_dq = dequantize_fp8_e4m3(a_q.cpu(), sa.cpu(), torch.float32)
+            b_dq = dequantize_matrix_blockwise_2d(b_q.cpu(), sb.cpu())
+            ref_outputs.append(torch.matmul(a_dq, b_dq.t()).to(torch.float32))
+            row += m_i
+
+        b_stack = torch.stack(b_list).contiguous()
+        sb_stack = torch.stack(sb_list).contiguous()
+        output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+
+        empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
+        problem_sizes = torch.tensor(
+            [[m_i, n, k] for m_i in m_per_expert],
+            dtype=torch.int32,
+            device=device,
+        )
+        expert_offsets = torch.tensor(
+            expert_offsets_h, dtype=torch.int32, device=device
+        )
+
+        # Unused interface-compat args.
+        zeros_i64 = torch.zeros((num_experts,), dtype=torch.int64, device=device)
+        zeros_i32 = torch.zeros((num_experts, 5), dtype=torch.int32, device=device)
+        workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
+
+        from sgl_kernel import fp8_blockwise_scaled_grouped_mm
+
+        fp8_blockwise_scaled_grouped_mm(
+            output,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            empty_ptrs,
+            a_flat,
+            b_stack,
+            sa_flat,
+            sb_stack,
+            zeros_i64,
+            zeros_i64,
+            zeros_i64,
+            zeros_i32,
+            zeros_i32,
+            problem_sizes,
+            expert_offsets,
+            workspace,
+        )
+
+        row = 0
+        for e, m_i in enumerate(m_per_expert):
+            kernel_out = output[row : row + m_i].cpu()
+            ref_out = ref_outputs[e]
+            assert not torch.isnan(kernel_out).any(), f"Expert {e}: NaN"
+            assert (
+                kernel_out.shape == ref_out.shape
+            ), f"Expert {e}: shape {kernel_out.shape} vs ref {ref_out.shape}"
+            torch.testing.assert_close(kernel_out, ref_out, atol=2.0, rtol=0.2)
+            row += m_i

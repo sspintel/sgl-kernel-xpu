@@ -71,7 +71,12 @@ class BlockScaledGroupedGemmRunner {
       const torch::Tensor& scales_b,
       const torch::Tensor& problem_sizes,
       const torch::Tensor& expert_offsets,
-      const torch::Tensor& workspace) {
+      const torch::Tensor& workspace,
+      // When >0, override the M-dimension stride of A-scales with this fixed
+      // value (used when scales were packed with stride max_m for padded
+      // ragged-M layouts, not per-expert m_i). When 0/default, build the
+      // stride from problem_sizes[e][0].
+      int scales_a_m_stride_override = 0) {
 
     TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3,
                 "problem_sizes must be (num_experts, 3)");
@@ -87,27 +92,38 @@ class BlockScaledGroupedGemmRunner {
     TORCH_CHECK(num_groups > 0,
                 "Number of experts must be positive, got ", num_groups);
 
-    TORCH_CHECK(a.dim() == 3,
-                "Input tensor A must be 3-dimensional, got ", a.dim(), " dimensions");
-    TORCH_CHECK(b.dim() == 3,
-                "Input tensor B must be 3-dimensional, got ", b.dim(), " dimensions");
+    // CUTLASS itself only consumes the per-expert pointer arrays and
+    // problem_sizes; A and output can be either 3D-stacked (E, M, K) (used
+    // by MXFP4) or flat 2D (sum_m_i, K) (used by MXFP8 + the on-device prep
+    // path). Validate that experts and shapes line up but don't constrain dim.
+    TORCH_CHECK(a.dim() == 2 || a.dim() == 3,
+                "Input tensor A must be 2D or 3D, got ", a.dim(), " dimensions");
+    TORCH_CHECK(output.dim() == 2 || output.dim() == 3,
+                "Output tensor must be 2D or 3D, got ", output.dim(), " dimensions");
+    if (a.dim() == 3) {
+      TORCH_CHECK(a.size(0) == num_groups,
+                  "Tensor A batch size must match num_experts: expected ", num_groups, " got ", a.size(0));
+    }
+    if (output.dim() == 3) {
+      TORCH_CHECK(output.size(0) == num_groups,
+                  "Output batch size must match num_experts: expected ", num_groups, " got ", output.size(0));
+    }
+    // The scales_a tensor passed here is the buffer the kernel actually reads
+    // from (transposed by on-device prep, or pre-transposed by the caller).
+    // In both cases it's 3D (E, scale_cols, max_m or m_i).
     TORCH_CHECK(scales_a.dim() == 3,
-                "Scales tensor A must be 3-dimensional, got ", scales_a.dim(), " dimensions");
-    TORCH_CHECK(scales_b.dim() == 3,
-                "Scales tensor B must be 3-dimensional, got ", scales_b.dim(), " dimensions");
-    TORCH_CHECK(output.dim() == 3,
-                "Output tensor must be 3-dimensional, got ", output.dim(), " dimensions");
-
-    TORCH_CHECK(a.size(0) == num_groups,
-                "Tensor A batch size must match num_experts: expected ", num_groups, " got ", a.size(0));
-    TORCH_CHECK(b.size(0) == num_groups,
-                "Tensor B batch size must match num_experts: expected ", num_groups, " got ", b.size(0));
+                "Scales tensor A must be 3-dimensional (transposed), got ", scales_a.dim(), " dimensions");
     TORCH_CHECK(scales_a.size(0) == num_groups,
                 "Scales A batch size must match num_experts: expected ", num_groups, " got ", scales_a.size(0));
+    // B and B-scales are always 3D per-expert (weights are uniform per expert).
+    TORCH_CHECK(b.dim() == 3,
+                "Input tensor B must be 3-dimensional, got ", b.dim(), " dimensions");
+    TORCH_CHECK(scales_b.dim() == 3,
+                "Scales tensor B must be 3-dimensional, got ", scales_b.dim(), " dimensions");
+    TORCH_CHECK(b.size(0) == num_groups,
+                "Tensor B batch size must match num_experts: expected ", num_groups, " got ", b.size(0));
     TORCH_CHECK(scales_b.size(0) == num_groups,
                 "Scales B batch size must match num_experts: expected ", num_groups, " got ", scales_b.size(0));
-    TORCH_CHECK(output.size(0) == num_groups,
-                "Output batch size must match num_experts: expected ", num_groups, " got ", output.size(0));
 
     TORCH_CHECK(a.is_contiguous(), "Input tensor A must be contiguous.");
     TORCH_CHECK(b.is_contiguous(), "Input tensor B must be contiguous.");
@@ -139,7 +155,14 @@ class BlockScaledGroupedGemmRunner {
     torch::Tensor stride_B_dev  = K_col.to(torch::kInt64).contiguous();
     torch::Tensor stride_CD_dev = N_col.to(torch::kInt64).contiguous();
 
-    auto stride_SFA_dev = build_scale_stride_A(M_col, N_col, K_col, num_groups, opts_i64);
+    // For padded ragged-M layouts, the A-scale M-stride between scale columns
+    // is the buffer's max_m (stride(1) of the per-expert (scale_cols, max_m)
+    // slice), not per-expert m_i. When the caller passes an override, fan it
+    // out across experts so every StrideScaleA entry uses it.
+    torch::Tensor M_col_for_sfa = (scales_a_m_stride_override > 0)
+        ? torch::full({num_groups}, static_cast<int64_t>(scales_a_m_stride_override), opts_i64)
+        : M_col.to(torch::kInt64);
+    auto stride_SFA_dev = build_scale_stride_A(M_col_for_sfa, N_col, K_col, num_groups, opts_i64);
     auto stride_SFB_dev = build_scale_stride_B(M_col, N_col, K_col, num_groups, opts_i64);
 
     auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(

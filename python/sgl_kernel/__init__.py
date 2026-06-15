@@ -19,6 +19,10 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
+from sgl_kernel.cutlass_moe import (
+    cutlass_fused_experts_fp8,
+    cutlass_fused_experts_mxfp4,
+)
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
