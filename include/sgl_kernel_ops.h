@@ -666,8 +666,10 @@ void moe_grouped_mm_nt_xe35(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type = 0,  // 0=silu, 1=gelu
-    bool fuse_act = false);
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 torch::Tensor fp8_scaled_mm_xpu(

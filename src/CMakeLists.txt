@@ -42,7 +42,7 @@ list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
 list(APPEND ATen_XPU_SYCL_XE35 ${device_cpp_xe35})
 list(APPEND ATen_XPU_SYCL_XE40 ${device_cpp_xe40})
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmSIMD.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe20.cmake)
 
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
