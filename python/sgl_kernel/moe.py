@@ -587,7 +587,9 @@ def fused_experts(
                     E,
                     activation_type,
                     fuse_act=False,
-                    gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                    gemm1_alpha=(
+                        float(gemm1_alpha) if gemm1_alpha is not None else 1.702
+                    ),
                     gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             if activation_type in (0, 4):
@@ -601,7 +603,9 @@ def fused_experts(
                     intermediate_cache1[:, half:].clamp_(
                         min=-swiglu_limit, max=swiglu_limit
                     )
-                torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+                torch.ops.sgl_kernel.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
             elif activation_type == 1:
                 torch.ops.sgl_kernel.gelu_tanh_and_mul(
                     intermediate_cache2, intermediate_cache1
@@ -637,7 +641,9 @@ def fused_experts(
                     E,
                     activation_type,
                     fuse_act=False,
-                    gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                    gemm1_alpha=(
+                        float(gemm1_alpha) if gemm1_alpha is not None else 1.702
+                    ),
                     gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
         else:
@@ -669,7 +675,9 @@ def fused_experts(
                     E,
                     activation_type,
                     fuse_act=True,
-                    gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                    gemm1_alpha=(
+                        float(gemm1_alpha) if gemm1_alpha is not None else 1.702
+                    ),
                     gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
@@ -697,7 +705,9 @@ def fused_experts(
                     E,
                     activation_type,
                     fuse_act=False,
-                    gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                    gemm1_alpha=(
+                        float(gemm1_alpha) if gemm1_alpha is not None else 1.702
+                    ),
                     gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
     else:

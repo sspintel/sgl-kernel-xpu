@@ -37,9 +37,9 @@
 #include <cute/tensor.hpp>
 
 #include "../../../Utils.h"
+#include "bf16/moe_kernel.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "bf16/moe_kernel.hpp"
 
 using namespace cute;
 using namespace MoE;

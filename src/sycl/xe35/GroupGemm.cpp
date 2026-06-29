@@ -14,8 +14,16 @@ void moe_grouped_mm_nt_xe35(
     double gemm1_alpha,
     double gemm1_limit) {
   moe_grouped_mm_nt_xe20(
-      output, activations, weights, bias, total_rows_for_experts, n_experts, activation_type, fuse_act,
-      gemm1_alpha, gemm1_limit);
+      output,
+      activations,
+      weights,
+      bias,
+      total_rows_for_experts,
+      n_experts,
+      activation_type,
+      fuse_act,
+      gemm1_alpha,
+      gemm1_limit);
 }
 
 #undef SYCL_INTEL_TARGET
