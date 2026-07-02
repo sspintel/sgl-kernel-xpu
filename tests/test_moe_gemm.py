@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
-from sgl_kernel import fused_experts
+from sgl_kernel import fused_experts, is_xe2_arch
 
 
 def apply_act_and_mul(
@@ -220,8 +220,10 @@ def test_moe_gemm(
         b1,
         b2,
         activations=act_type,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_limit=gemm1_limit,
+        gemm1_alpha=(
+            gemm1_alpha if is_xe2_arch() else None
+        ),  # swiglu_gpt_oss only supported on xe2
+        gemm1_limit=gemm1_limit if is_xe2_arch() else None,
         routed_scaling_factor=routed_scaling_factor,
     )
 
@@ -243,8 +245,10 @@ def test_moe_gemm(
         b1_xpu,
         b2_xpu,
         activation=act_type,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_limit=gemm1_limit,
+        gemm1_alpha=(
+            gemm1_alpha if is_xe2_arch() else None
+        ),  # swiglu_gpt_oss only supported on xe2
+        gemm1_limit=gemm1_limit if is_xe2_arch() else None,
         routed_scaling_factor=routed_scaling_factor,
     )
     torch.testing.assert_close(
