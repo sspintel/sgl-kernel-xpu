@@ -12,7 +12,7 @@ device = utils.get_device()
 
 @pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -57,7 +57,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 @pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -119,7 +119,7 @@ def torch_top_k_renorm_probs(normalized_prob, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
@@ -141,7 +141,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
 def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
@@ -175,7 +175,7 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
 
 @pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
