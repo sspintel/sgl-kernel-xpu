@@ -10,7 +10,9 @@ import utils
 device = utils.get_device()
 
 
-@pytest.mark.parametrize("dim", [128, 256, 512, 768, 2048, 4096, 11008, 16384, 25600, 28672])
+@pytest.mark.parametrize(
+    "dim", [128, 256, 512, 768, 2048, 4096, 11008, 16384, 25600, 28672]
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 128])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
 def test_fused_silu_mul(dim, batch_size, seq_len):

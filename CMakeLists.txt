@@ -65,10 +65,13 @@ endif()
 # cutlass — repo and commit depend on the target architecture
 if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "64584484b4279b1b4184b508af445698a4a1b603")
+  set(CUTLASS_SYCL_TAG  "525faea3f0f43a8aec2d21a70d44111db639a3a9")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
-  set(CUTLASS_SYCL_TAG  "3f40bddb80b1c560bd7b9198aff8894db557025a")
+  # 8de697f18 (Jul 2 2026, PR #755): moves the `Base` typedef in
+  # xe_array_mma_blockscaled_{native,fallback}.hpp from private to public,
+  # required for blockwise_moe_{mxfp4,mxfp8}.cpp to compile.
+  set(CUTLASS_SYCL_TAG  "8de697f181b39ecec3878b3dcfd6f106dfcdbfac")
 elseif(DPCPP_SYCL_TARGET MATCHES "jgs")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
   set(CUTLASS_SYCL_TAG  "439fd778b16de695d388eb9efc67b88c94828a3f")

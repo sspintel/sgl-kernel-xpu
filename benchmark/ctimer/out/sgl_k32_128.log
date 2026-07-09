@@ -1,0 +1,11 @@
+[sgl-ctimer] device: Intel(R) Graphics [0x674c]  profiling=1
+
+gemm1_gate_up: N=1536 K=2048
+ avg_m  total_m       TFLOP/s         ms
+     1        8         1.243     0.0405
+    32      256        36.467     0.0442
+   128     1024       115.273     0.0559
+
+gemm2_down: N=2048 K=768
+ avg_m  total_m       TFLOP/s         ms
+     1        8         0.906     0.0278

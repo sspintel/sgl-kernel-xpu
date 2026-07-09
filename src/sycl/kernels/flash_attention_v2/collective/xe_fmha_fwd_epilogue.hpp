@@ -143,7 +143,7 @@ class FMHAFwdEpilogue {
   FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
   template <typename QVCoord>
-  CUTLASS_DEVICE void operator()(
+  SYCL_EXTERNAL CUTLASS_DEVICE void operator()(
       TensorO2D const& O,                     // Global O tensor: (q,v)
       FragA& tArA,                            // O accumulator:   (q,v)
       FragARow& tA_max,                       // Softmax row-wise max accumulator
@@ -156,49 +156,15 @@ class FMHAFwdEpilogue {
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
-    /* PackGQA decode: each packed M row is a distinct query head sharing the
-       same decode position, so the sink logit is per-row. Add it to the
-       per-subgroup running sum BEFORE the cross-subgroup reduction (mirrors the
-       split-decode epilogue): lane `l` of subgroup 0 owns packed row `l`, and
-       reduce_A rescales this contribution by exp2(sg0_max - global_max). The
-       running max/sum are kept in log2 units (exp2 space), so the sink logit is
-       likewise scaled by log2e. */
-    if constexpr (Sink && PackGQA_) {
-      constexpr double kLog2e = 1.4426950408889634074;
-      int sg_id = thr_id / intel::sg_size;
-      int lane = thr_id % intel::sg_size;
-      if (sg_id == 0 && lane < head_group_q) {
-        const ElementA s = static_cast<ElementA>(sink_ptr[lane] * kLog2e);
-        if (tA_sum(0) != ElementA(0)) {
-          // Subgroup 0 holds in-window tokens for this row: add the sink
-          // relative to its partial max. reduce_A later rescales this whole
-          // contribution by exp2(sg0_max - global_max), giving exp2(sink -
-          // global_max) regardless of which subgroup owns the global max.
-          tA_sum(0) += sycl::native::exp2(s - tA_max(0));
-        } else {
-          // Subgroup 0 has no in-window tokens for this row (partial max is
-          // -inf), but other subgroups (k-blocks) may. The old guard dropped
-          // the sink here, shrinking the denominator; removing it instead
-          // overflowed exp2(s - (-inf)) to +inf -> inf*0 = NaN after rescale.
-          // Seed sg0's max with the sink logit and its sum with exp2(s - s) = 1
-          // so the cross-subgroup reduction rescales the sink to the true
-          // global max. Fully-masked rows (no tokens anywhere) end up with
-          // denominator 1 and zero P*V, i.e. output 0, matching the reference.
-          tA_max(0) = s;
-          tA_sum(0) = ElementA(1);
-        }
-      }
-    }
-
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_max_local, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Add sink token contribution to softmax denominator.
-       sink_val is the raw logit for the sink token (same for every query row).
-       We add exp2(sink_val * log2e - row_max) to each row's running sum. */
+    /* Non-packed sink (prefill / MHA decode): every row in this tile belongs to
+       the SAME query head, so a single scalar sink applies to all rows. Add
+       exp2(sink_val * log2e - row_max) to each row's running sum. */
     if constexpr (Sink && !PackGQA_) {
       constexpr double kLog2e = 1.4426950408889634074;
       CUTLASS_PRAGMA_UNROLL
@@ -211,23 +177,8 @@ class FMHAFwdEpilogue {
       }
     }
 
-    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
-       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
-       so emit 0 instead of NaN to match the reference implementation. */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++) {
-      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
-        rA_sum(i) = safe_recip(rA_sum(i));
-      } else {
-        rA_sum(i) = ElementA(1) / rA_sum(i);
-      }
-    }
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
-
-    /* Tile output */
+    /* Tile output coordinates. cO/gO are identity tensors, so tOgO exposes the
+       (q,v) coordinate of each output fragment element. */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
     Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
 
@@ -238,16 +189,82 @@ class FMHAFwdEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    /* Reorder tile and write out */
-    reorder(rA, tOrO);
-    copy(copy_o, tOrO, tOgO);
+    if constexpr (Sink && PackGQA_) {
+      /* Packed-GQA decode stacks head_group_q distinct query heads into the row
+         dimension, so each row needs its OWN sink logit. Unlike the split-decode
+         epilogue, the general mainloop's reduced row fragment does NOT preserve
+         the query-head order across (subgroup, lane), so we cannot index the
+         sink by lane. Instead fold the per-row sink into the denominator in
+         OUTPUT-element space, where tOgO gives each element's q coordinate
+         (= query head within the KV group). Build the per-element denominator
+         (sum of weights) and row max in the A layout via broadcast<0>, reorder
+         both into the output fragment layout, then divide each element by
+         (sum_w + sink_term) using that element's own head. */
+      constexpr double kLog2e = 1.4426950408889634074;
+      auto denom_e = rA;  // per-element softmax denominator (sum of weights)
+      auto max_e = rA;    // per-element row max
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        denom_e(i) = broadcast<0>(rA_sum, rA, i);
+        max_e(i) = broadcast<0>(rA_max_local, rA, i);
+      }
+      // Keep numerator / denominator / row max in float (ElementA); the output
+      // fragment tOrO is ElementO (e.g. bf16), so doing the division there would
+      // round the denominator and degrade accuracy. Only the final result casts
+      // to ElementO when written into tOrO. reorder() requires SubgroupTensor
+      // destinations, so wrap the float fragments with tOrO's TV layout.
+      auto tv = tOrO.tv_layout();
+      auto tO_num = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+      auto tO_denom = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+      auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+      reorder(rA, tO_num);  // un-normalized accumulator in output layout
+      reorder(denom_e, tO_denom);
+      reorder(max_e, tO_max);
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < int(tO_num.size()); j++) {
+        ElementA denom = tO_denom(j);
+        int head_off = int(get<0>(tOgO(j)));
+        // Guard against padded rows (qg_sz rounded up beyond head_group_q).
+        if (head_off < head_group_q) {
+          ElementA sink_term = sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
+          if (sycl::isfinite(sink_term)) {
+            denom += sink_term;
+          }
+        }
+        // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
+        ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
+        tOrO(j) = static_cast<ElementO>(outv);
+      }
+      copy(copy_o, tOrO, tOgO);
+    } else {
+      /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+         zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+         so emit 0 instead of NaN to match the reference implementation. */
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+          rA_sum(i) = safe_recip(rA_sum(i));
+        } else {
+          rA_sum(i) = ElementA(1) / rA_sum(i);
+        }
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++)
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+      /* Reorder tile and write out */
+      reorder(rA, tOrO);
+      copy(copy_o, tOrO, tOgO);
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
   template <typename FragA, typename FragARow>
-  CUTLASS_DEVICE decltype(auto) reduce_A(
+  SYCL_EXTERNAL CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA& tArA,       // O accumulator:   (q,v)
       FragARow& tA_max,  // Softmax row-wise max accumulator
       FragARow& tA_sum,  // Softmax row-wise sum accumulator
@@ -276,6 +293,11 @@ class FMHAFwdEpilogue {
       auto sA_coords = make_layout(
           append(SGTileShapeO{}, shape(ReduceSGLayout{})), append(basis2, product_each(zip(SGTileShapeO{}, basis2))));
 
+      auto basis1 = make_basis_like(take<0, 1>(SGTileShapeO{}));
+      auto sA_row_coords = make_layout(
+          append(take<0, 1>(SGTileShapeO{}), shape(ReduceSGLayout{})),
+          append(basis1, make_stride(get<0>(product_each(zip(take<0, 1>(SGTileShapeO{}), basis1))), _0{})));
+
       auto sA = make_tensor(make_smem_ptr<ElementA>(&shared.a_data), sA_layout);  // (q,v,rblk_dst,rblk_src,a_tile)
       auto sA_max =
           make_tensor(make_smem_ptr<ElementA>(&shared.a_max_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
@@ -283,9 +305,9 @@ class FMHAFwdEpilogue {
           make_tensor(make_smem_ptr<ElementA>(&shared.a_sum_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
-      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
+      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile), sA_row_coords);
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
+      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile), sA_row_coords);
       copy_block_r2s(tArA, sA(_, _, _, k_blk, a_tile), sA_coords);
 
       bool active = (k_blk < size(ReduceSGLayout{})) || (ReduceK{} == size(ReduceSGLayout{}));  // help compiler out
@@ -301,17 +323,21 @@ class FMHAFwdEpilogue {
         /* Read A_max back from SLM and reduce. */
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
+          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_kmax[kr]);
         }
 
         rA_max = rA_kmax[0];
-        for (int kr = 1; kr < ReduceK{}; kr++)
-          cute::transform(rA_max, rA_kmax[kr], rA_max, cute::max_fn{});
+        for (int kr = 1; kr < ReduceK{}; kr++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_max.size(); i++)
+            rA_max(i) = sycl::max(rA_max(i), rA_kmax[kr](i));
+        }
 
         /* Calculate scale factors for aligning per-block maxima. */
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          cute::transform(
-              rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) { return sycl::native::exp2(kmax - gmax); });
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_max.size(); i++)
+            rA_kmax[kr](i) = sycl::native::exp2(rA_kmax[kr](i) - rA_max(i));
         }
       }
 
@@ -325,7 +351,7 @@ class FMHAFwdEpilogue {
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
           ReduceFragARow rA_sum_read;
-          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), rA_sum_read);
+          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_sum_read);
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < rA_sum_read.size(); i++) {
@@ -452,7 +478,7 @@ class DecodeFwdEpilogue {
   DecodeFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
   template <typename QVCoord>
-  CUTLASS_DEVICE void operator()(
+  SYCL_EXTERNAL CUTLASS_DEVICE void operator()(
       TensorO2D const& O,  // Global O tensor: (q,v)
       FragA& tArA,         // O accumulator:   (q,v)
       FragARow& tA_max,    // Softmax row-wise max accumulator
@@ -503,7 +529,7 @@ class DecodeFwdEpilogue {
 
   // splitK version
   template <typename QVCoord, class TensorSink>
-  CUTLASS_DEVICE void operator()(
+  SYCL_EXTERNAL CUTLASS_DEVICE void operator()(
       TensorO2D const& O,             // Global O tensor: (q,v)
       FragA& tArA,                    // O accumulator:   (q,v)
       FragARow& tA_max,               // Softmax row-wise max accumulator
@@ -596,7 +622,7 @@ class DecodeFwdEpilogue {
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
   template <typename FragA, typename FragARow>
-  CUTLASS_DEVICE decltype(auto) reduce_A(
+  SYCL_EXTERNAL CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA& tArA,       // O accumulator:   (q,v)
       FragARow& tA_max,  // Softmax row-wise max accumulator
       FragARow& tA_sum,  // Softmax row-wise sum accumulator
@@ -628,6 +654,11 @@ class DecodeFwdEpilogue {
       auto sA_coords = make_layout(
           append(SGTileShapeO{}, shape(ReduceSGLayout{})), append(basis2, product_each(zip(SGTileShapeO{}, basis2))));
 
+      auto basis1 = make_basis_like(take<0, 1>(SGTileShapeO{}));
+      auto sA_row_coords = make_layout(
+          append(take<0, 1>(SGTileShapeO{}), shape(ReduceSGLayout{})),
+          append(basis1, make_stride(get<0>(product_each(zip(take<0, 1>(SGTileShapeO{}), basis1))), _0{})));
+
       auto sA = make_tensor(make_smem_ptr<ElementA>(&shared.a_data),
                             sA_layout);  // (q,v,rblk_dst,rblk_src,a_tile)
       auto sA_max = make_tensor(
@@ -638,9 +669,9 @@ class DecodeFwdEpilogue {
           sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
-      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
+      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile), sA_row_coords);
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
+      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile), sA_row_coords);
       copy_block_r2s(tArA, sA(_, _, _, k_blk, a_tile), sA_coords);
 
       bool active = (k_blk < size(ReduceSGLayout{})) || (ReduceK{} == size(ReduceSGLayout{}));  // help compiler out
@@ -656,17 +687,21 @@ class DecodeFwdEpilogue {
         /* Read A_max back from SLM and reduce. */
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
+          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_kmax[kr]);
         }
 
         rA_max = rA_kmax[0];
-        for (int kr = 1; kr < ReduceK{}; kr++)
-          cute::transform(rA_max, rA_kmax[kr], rA_max, cute::max_fn{});
+        for (int kr = 1; kr < ReduceK{}; kr++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_max.size(); i++)
+            rA_max(i) = sycl::max(rA_max(i), rA_kmax[kr](i));
+        }
 
         /* Calculate scale factors for aligning per-block maxima. */
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          cute::transform(
-              rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) { return sycl::native::exp2(kmax - gmax); });
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < rA_max.size(); i++)
+            rA_kmax[kr](i) = sycl::native::exp2(rA_kmax[kr](i) - rA_max(i));
         }
       }
 
@@ -681,7 +716,7 @@ class DecodeFwdEpilogue {
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
           ReduceFragARow rA_sum_read;
-          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), rA_sum_read);
+          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_sum_read);
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < rA_sum_read.size(); i++) {

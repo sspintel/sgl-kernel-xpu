@@ -66,7 +66,7 @@ struct MXFP8Types {
   // Mainloop dispatch (tuple GroupSize → FP8 block-scaled mainloop)
   static constexpr int PipelineStages = 2;
   using GroupSizeMNK = cute::tuple<cute::_1, cute::Int<BlockSize>, cute::Int<BlockSize>>;
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroupImpl<
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<
       PipelineStages, GroupSizeMNK>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
 

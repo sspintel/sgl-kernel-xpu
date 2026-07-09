@@ -17,7 +17,9 @@ def swiglu_gpt_oss_sigmoid_alpha_ref(x, gemm1_alpha, gemm1_limit):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("limit", [1.0, 5.0, 7.0, 10.0])
 @pytest.mark.parametrize("alpha", [0.5, 1.0, 1.702, 2.0])
-@pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 5120, 8192])
+@pytest.mark.parametrize(
+    "hidden_size", [64, 128, 256, 512, 1024, 2048, 4096, 5120, 8192]
+)
 @pytest.mark.parametrize("batch_size", [1, 16, 128, 512, 1024])
 def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dtype):
     # Ensure hidden_size is even for gate/up split

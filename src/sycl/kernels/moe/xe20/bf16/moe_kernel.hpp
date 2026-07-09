@@ -206,6 +206,13 @@ class MoEGEMM {
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
 
+    // Precompute total work tiles across all experts for O(1) end-of-work detection
+    int total_tiles = 0;
+    for (int i = 0; i < num_experts; ++i) {
+      total_tiles += (M_per_group[i] + wg_tile_m - 1) / wg_tile_m;
+    }
+    if (group_m_id >= total_tiles) return;
+
     if (group_id == 0 && thr_id == 0) {
       auto atm = sycl::atomic_ref<
           int,
@@ -275,6 +282,7 @@ class MoEGEMM {
         item.barrier(sycl::access::fence_space::local_space);
         group_id = group_range + slm_mem[0];
         group_m_id = (group_id * wg_tile_n) / N_pad;
+        if (group_m_id >= total_tiles) return;
       }
       pre_rows = cumsum_rows_for_experts;
       pre_tiles = cumsum_tiles_for_experts;

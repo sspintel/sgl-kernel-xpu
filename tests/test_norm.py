@@ -63,7 +63,9 @@ def fused_add_rms_norm(x, residual, weight, eps):
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 128, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384])
+@pytest.mark.parametrize(
+    "hidden_size", [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384]
+)
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_norm(batch_size, hidden_size, dtype, specify_out):
@@ -81,7 +83,9 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 128, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384])
+@pytest.mark.parametrize(
+    "hidden_size", [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384]
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
