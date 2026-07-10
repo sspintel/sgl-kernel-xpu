@@ -149,26 +149,22 @@ def torch_naive_moe(
     return result
 
 
+@pytest.mark.parametrize("routed_scaling_factor", [2.5])
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act,routed_scaling_factor",
-    list(
-        itertools.product(
-            [1, 4, 33, 64, 222],  # num_tokens
-            [1, 2, 6],  # topk
-            [8, 64],  #  num_experts
-            [128, 1024],  # hidden_size
-            [128, 512, 1024],  # intermediate_size
-            [False, "bfloat16", "float32"],  # bias_dtype
-            [
-                ("silu", None, None),
-                ("gelu", None, None),
-                ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
-                ("relu2", None, None),
-            ],  # (act_type, gemm1_alpha, gemm1_limit)
-            [2.5],
-        )
-    ),
+    "act",
+    [
+        ("silu", None, None),
+        ("gelu", None, None),
+        ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
+        ("relu2", None, None),
+    ],  # (act_type, gemm1_alpha, gemm1_limit)
 )
+@pytest.mark.parametrize("bias_dtype", [False, "bfloat16", "float32"])
+@pytest.mark.parametrize("intermediate_size", [128, 512, 768, 1024])
+@pytest.mark.parametrize("hidden_size", [128, 1024, 2048])
+@pytest.mark.parametrize("num_experts", [8, 64, 128])
+@pytest.mark.parametrize("topk", [1, 2, 6, 8])
+@pytest.mark.parametrize("num_tokens", [1, 4, 33, 64, 128, 222])
 def test_moe_gemm(
     num_tokens,
     topk,
