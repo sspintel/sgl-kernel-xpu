@@ -1,4 +1,4 @@
-# SGL Kernel for XPU
+# SGL Kernel for XPU:
 
 A fork of [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang support on Intel GPU backend
 
