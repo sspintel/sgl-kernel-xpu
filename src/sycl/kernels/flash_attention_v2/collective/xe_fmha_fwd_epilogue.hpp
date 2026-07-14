@@ -305,9 +305,12 @@ class FMHAFwdEpilogue {
           make_tensor(make_smem_ptr<ElementA>(&shared.a_sum_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
-      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile), sA_row_coords);
+      // Row (max/sum) copies use the 2-arg flat overload; only the 2D accumulator
+      // (tArA/sA) needs the coordinate-aware 3-arg overload. Matches upstream
+      // cutlass FA v2 epilogue at sycl-tla pin 439fd778b.
+      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile), sA_row_coords);
+      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
       copy_block_r2s(tArA, sA(_, _, _, k_blk, a_tile), sA_coords);
 
       bool active = (k_blk < size(ReduceSGLayout{})) || (ReduceK{} == size(ReduceSGLayout{}));  // help compiler out
@@ -323,7 +326,7 @@ class FMHAFwdEpilogue {
         /* Read A_max back from SLM and reduce. */
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_kmax[kr]);
+          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
         }
 
         rA_max = rA_kmax[0];
@@ -351,7 +354,7 @@ class FMHAFwdEpilogue {
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
           ReduceFragARow rA_sum_read;
-          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_sum_read);
+          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), rA_sum_read);
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < rA_sum_read.size(); i++) {
@@ -669,9 +672,12 @@ class DecodeFwdEpilogue {
           sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
-      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile), sA_row_coords);
+      // Row (max/sum) copies use the 2-arg flat overload; only the 2D accumulator
+      // (tArA/sA) needs the coordinate-aware 3-arg overload. Matches upstream
+      // cutlass FA v2 epilogue at sycl-tla pin 439fd778b.
+      copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
-      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile), sA_row_coords);
+      copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
       copy_block_r2s(tArA, sA(_, _, _, k_blk, a_tile), sA_coords);
 
       bool active = (k_blk < size(ReduceSGLayout{})) || (ReduceK{} == size(ReduceSGLayout{}));  // help compiler out
@@ -687,7 +693,7 @@ class DecodeFwdEpilogue {
         /* Read A_max back from SLM and reduce. */
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
-          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_kmax[kr]);
+          copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
         }
 
         rA_max = rA_kmax[0];
@@ -716,7 +722,7 @@ class DecodeFwdEpilogue {
         CUTLASS_PRAGMA_UNROLL
         for (int kr = 0; kr < ReduceK{}; kr++) {
           ReduceFragARow rA_sum_read;
-          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), sA_row_coords(_, 0), rA_sum_read);
+          copy_block_s2r(sA_sum(_, k_blk, kr, a_tile), rA_sum_read);
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < rA_sum_read.size(); i++) {

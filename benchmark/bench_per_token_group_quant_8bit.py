@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
+from sgl_kernel import sgl_per_token_group_quant_8bit
 
 fp8_type_ = torch.float8_e4m3fn
 
@@ -125,11 +125,22 @@ def sglang_per_token_group_quant_8bit(
 
     if dst_dtype == torch.int8:
         iinfo = torch.iinfo(dst_dtype)
-        x_q, x_s = sgl_per_token_group_quant_int8(x, group_size, eps)
+        min_8bit = float(iinfo.min)
+        max_8bit = float(iinfo.max)
     else:
-        f8_info = torch.finfo(dst_dtype)
-        x_q, x_s = sgl_per_token_group_quant_fp8(x, group_size, eps)
+        finfo = torch.finfo(dst_dtype)
+        min_8bit = float(finfo.min)
+        max_8bit = float(finfo.max)
 
+    x_q = torch.empty(x.shape, device=x.device, dtype=dst_dtype)
+    x_s = torch.empty(
+        (*x.shape[:-1], x.shape[-1] // group_size),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    sgl_per_token_group_quant_8bit(
+        x, x_q, x_s, group_size, eps, min_8bit, max_8bit, False, False, None, False
+    )
     return x_q, x_s
 
 
