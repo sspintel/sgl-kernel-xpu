@@ -234,6 +234,7 @@ def flash_attn_with_kvcache(
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
+
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -272,7 +273,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        1,
+        max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,

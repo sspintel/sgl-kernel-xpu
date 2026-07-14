@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 SGLang Team. All Rights Reserved.
+/* Copyright 2025 SGLang Team. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,6 +43,10 @@ limitations under the License.
 /*
  * From flash-attention
  */
+#if SYCL_INTEL_TARGET == 20 || SYCL_INTEL_TARGET == 35
+/*
+ * From flash-attention
+ */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
@@ -75,6 +79,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     std::optional<at::Tensor>& out_);
+#endif
 
 void flash_mla_decode(
     torch::Tensor& out,

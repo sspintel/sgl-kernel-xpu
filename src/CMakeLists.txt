@@ -27,8 +27,10 @@ foreach(file ${device_cpp})
 
 endforeach()
 
+if(DPCPP_SYCL_TARGET MATCHES "bmg")
 include(FMHADecodeXe20.cmake)
 include(FMHAPrefillXe20.cmake)
+endif()
 include(MlaDecodeXe20.cmake)
 
 message(STATUS "BMG files: ${device_cpp_xe20}")

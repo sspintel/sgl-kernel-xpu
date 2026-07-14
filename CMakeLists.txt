@@ -42,6 +42,20 @@ include(FetchContent)
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)
 set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
+
+# Use SYCL device profiling events for GPU_Clock timing so that, like the cutlass
+# examples, GPU_Clock reports device (kernel) execution time instead of host
+# wall-clock time. This is essential to get meaningful timings on the simulator.
+option(SGL_ENABLE_SYCL_PROFILING "Use SYCL device events for GPU_Clock timing (matches cutlass)" ON)
+if(SGL_ENABLE_SYCL_PROFILING)
+  # Keep cutlass option and compiler defines aligned. If this cache var stays OFF,
+  # GPU_Clock can run without profiling event timestamps and report 0 elapsed.
+  set(CUTLASS_SYCL_PROFILING_ENABLED ON CACHE BOOL "Enable cutlass SYCL profiling path" FORCE)
+  add_compile_definitions(CUTLASS_SYCL_PROFILING_ENABLED)
+  add_compile_definitions(COMPAT_PROFILING_ENABLED)
+else()
+  set(CUTLASS_SYCL_PROFILING_ENABLED OFF CACHE BOOL "Enable cutlass SYCL profiling path" FORCE)
+endif()
 set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
 set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)
 

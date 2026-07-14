@@ -33,7 +33,7 @@ class KernelCur {};
 
 template <typename Kernel, int GrfSize = 256>
 static void launch(typename Kernel::Params params) {
-  static_assert(GrfSize == 128 || GrfSize == 256, "GRF size must be 128 or 256");
+  static_assert(GrfSize == 128 || GrfSize == 256 || GrfSize == 512, "GRF size must be 128, 256, or 512");
 
   compat::dim3 const block = Kernel::get_block_shape();
   compat::dim3 const grid = Kernel::get_grid_shape(params);
