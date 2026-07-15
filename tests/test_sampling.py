@@ -126,15 +126,16 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cpu")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, k)
 
+    normalized_prob = normalized_prob.to(f"{device}:0")
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, k)
 
     torch.testing.assert_close(
         renorm_prob_ground_truth,
-        renorm_prob,
+        renorm_prob.cpu(),
         rtol=1e-3,
         atol=1e-3,
     )
@@ -149,7 +150,7 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     if k_max > vocab_size:
         pytest.skip("k_max should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cpu")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Create per-row top-k array with varied values
@@ -162,12 +163,13 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     # Compute ground truth using unified function
     renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, top_k_arr)
 
+    normalized_prob = normalized_prob.to(f"{device}:0")
     # Test with per-row k array
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, top_k_arr)
 
     torch.testing.assert_close(
         renorm_prob_ground_truth,
-        renorm_prob,
+        renorm_prob.cpu(),
         rtol=1e-3,
         atol=1e-3,
     )
