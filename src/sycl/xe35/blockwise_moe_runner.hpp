@@ -167,6 +167,17 @@ class BlockScaledGroupedGemmRunner {
 
     auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
         problem_sizes.data_ptr<int32_t>());
+    // The block-scaled group mainloop's can_implement() iterates
+    // problem_shapes.get_host_problem_shape(i) to validate per-group M/N/K
+    // alignment. That accessor returns a default-constructed Shape{0,0,0}
+    // when host_problem_shapes is nullptr, which trips the "M==0" reject
+    // and yields "CUTLASS cannot implement this configuration". Build a
+    // host-side copy of problem_sizes and pass it through — it must remain
+    // alive through can_implement/initialize (kept as a local below).
+    auto problem_sizes_host = problem_sizes.to(
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+    auto* problem_sizes_host_ptr = reinterpret_cast<UnderlyingProblemShapeType const*>(
+        problem_sizes_host.data_ptr<int32_t>());
     auto* stride_A_ptr   = reinterpret_cast<StrideA*>(stride_A_dev.data_ptr<int64_t>());
     auto* stride_B_ptr   = reinterpret_cast<StrideB*>(stride_B_dev.data_ptr<int64_t>());
     auto* stride_C_ptr   = reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());
@@ -190,7 +201,7 @@ class BlockScaledGroupedGemmRunner {
 
     typename GemmKernel::Arguments gemm_args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        typename GemmKernel::ProblemShape{num_groups, problem_sizes_ptr, nullptr},
+        typename GemmKernel::ProblemShape{num_groups, problem_sizes_ptr, problem_sizes_host_ptr},
         typename GemmKernel::MainloopArguments{
             reinterpret_cast<ElementInputA const**>(a_ptrs.data_ptr()),
             stride_A_ptr,
