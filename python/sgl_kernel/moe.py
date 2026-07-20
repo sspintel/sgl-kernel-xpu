@@ -502,8 +502,10 @@ def fused_experts(
         else:
             moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20
     elif is_xe3_arch():
-        assert use_mxfp4_w4a16 is False, "MXFP4 W4A16 is not supported on Xe3"
-        moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35
+        if use_mxfp4_w4a16:
+            moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35_mxfp4_w4a16
+        else:
+            moe_grouped_mm_nt = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35
 
     # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
     # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).

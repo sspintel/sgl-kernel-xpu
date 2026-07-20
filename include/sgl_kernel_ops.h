@@ -672,6 +672,24 @@ void moe_grouped_mm_nt_xe35(
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
+
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM on Xe3 (CRI). Reuses the
+// AOT-compiled Xe20 launcher instances (there is no bf16 × e2m1 mixed
+// precision DPAS on Xe3 either — see include/cute/arch/mma_xe.hpp — so the
+// register-side E2M1→BF16 upcast path from BMG remains optimal); only the
+// tile-selection heuristic differs from moe_grouped_mm_nt_xe20_mxfp4_w4a16.
+void moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 torch::Tensor fp8_scaled_mm_xpu(

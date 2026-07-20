@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
-from sgl_kernel import fused_experts, is_xe2_arch
+from sgl_kernel import fused_experts, is_xe2_arch, is_xe3_arch
 
 
 def apply_act_and_mul(
@@ -20,7 +20,7 @@ def apply_act_and_mul(
     return act_func(x[..., :d]) * x[..., d:]
 
 
-def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
+def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
     """Create a random xpu tensor
 
     Args:
@@ -32,7 +32,7 @@ def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
     Returns:
         torch.Tensor: Randomly initialized xpu tensor
     """
-    return torch.empty(shape, dtype=dtype, device="cpu").normal_(mean, std)
+    return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
 
 
 def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
@@ -440,7 +440,9 @@ def _build_moe_gemm_inputs(
         (num_experts,), avg_m_per_expert, dtype=torch.int32, device="xpu"
     )
 
-    activations = create_random_xpu_tensor((total_m, gemm_k), torch.bfloat16)
+    activations_xpu = create_random_cpu_tensor((total_m, gemm_k), torch.bfloat16).to(
+        "xpu"
+    )
 
     # Build bf16 weights on CPU, quantize to mxfp4 there, then move to XPU.
     w_bf16_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), torch.bfloat16)
@@ -454,26 +456,32 @@ def _build_moe_gemm_inputs(
         "xpu"
     )
 
-    bias = None
+    bias_xpu = None
     if with_bias:
-        bias = create_random_xpu_tensor((num_experts, gemm_n), torch.float32, std=0.005)
+        bias_xpu = create_random_cpu_tensor(
+            (num_experts, gemm_n), torch.float32, std=0.005
+        ).to("xpu")
 
     out_cols = gemm_n // 2 if fuse_act else gemm_n
     output_bf16 = torch.empty((total_m, out_cols), dtype=torch.bfloat16, device="xpu")
     output_mxfp4 = torch.empty((total_m, out_cols), dtype=torch.bfloat16, device="xpu")
 
     return {
-        "activations": activations,
+        "activations": activations_xpu,
         "w_dq": w_dq_xpu,
         "w_packed": w_packed_xpu,
         "w_scale": w_scale_xpu,
         "total_rows": total_rows,
-        "bias": bias,
+        "bias": bias_xpu,
         "output_bf16": output_bf16,
         "output_mxfp4": output_mxfp4,
     }
 
 
+@pytest.mark.skipif(
+    not is_xe2_arch(),
+    reason="moe_grouped_mm_nt_xe20* ops are only registered on Xe2 (BMG) builds",
+)
 @pytest.mark.parametrize("num_tokens_per_expert", [1, 33, 222])
 @pytest.mark.parametrize("num_experts", [8])
 @pytest.mark.parametrize("hidden_size", [1024])
@@ -528,6 +536,94 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
 
     # Fused MXFP4 path.
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+        inputs["output_mxfp4"],
+        inputs["activations"],
+        inputs["w_packed"],
+        inputs["w_scale"],
+        inputs["bias"],
+        inputs["total_rows"],
+        num_experts,
+        activation_type,
+        fuse_act,
+        1.702,
+        7.0,
+    )
+
+    torch.testing.assert_close(
+        inputs["output_bf16"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
+    )
+
+
+# ---------------------------------------------------------------------------
+# Op-level test: moe_grouped_mm_nt_xe35_mxfp4_w4a16 vs. moe_grouped_mm_nt_xe35(dequant)
+# ---------------------------------------------------------------------------
+#
+# Xe3 (CRI) counterpart of test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op. Reuses
+# the same MXFP4 quant/dequant helpers and the same shape space; only the op
+# names change (xe20 -> xe35). Per include/sgl_kernel_ops.h, the Xe35 fused
+# MXFP4 grouped GEMM reuses the Xe20 launcher instances with a Xe3-specific
+# tile-selection heuristic, so both paths still see identical MXFP4-rounded
+# weights and any difference is bf16 GEMM arithmetic noise.
+
+
+@pytest.mark.skipif(
+    not is_xe3_arch(),
+    reason="moe_grouped_mm_nt_xe35* ops are only registered on Xe3 (CRI) builds",
+)
+@pytest.mark.parametrize("num_tokens_per_expert", [1, 33, 222])
+@pytest.mark.parametrize("num_experts", [8])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("fuse_act", [False, True])
+def test_moe_grouped_mm_nt_xe35_mxfp4_w4a16_op(
+    num_tokens_per_expert,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    fuse_act,
+):
+    """Direct op-level comparison: mxfp4 fused op vs. bf16 op on dequant weights (Xe3/CRI).
+
+    gemm_k = hidden_size (activation's inner dim)
+    gemm_n = 2*intermediate_size (w1 style) — we pick one shape for simplicity
+    For fuse_act=True the output has N/2 cols, so gemm_n must be even.
+
+    The fused MXFP4 kernel is built silu + no-bias only (see
+    src/GroupGemmMxfp4W4A16Xe20.cmake — pruned to keep L0 module pressure
+    sane under TP>1), so this op-level test pins activation=silu and
+    bias=None.
+    """
+    activation_type = 0  # silu
+    gemm_k = hidden_size
+    gemm_n = 2 * intermediate_size
+    assert gemm_n % 2 == 0
+    assert gemm_k % 32 == 0, "gemm_k must be a multiple of MXFP4 group size"
+
+    inputs = _build_moe_gemm_inputs(
+        num_experts=num_experts,
+        avg_m_per_expert=num_tokens_per_expert,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        with_bias=False,
+        fuse_act=fuse_act,
+    )
+
+    # Baseline: bf16 op on the dequantised weights.
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35(
+        inputs["output_bf16"],
+        inputs["activations"],
+        inputs["w_dq"],
+        inputs["bias"],
+        inputs["total_rows"],
+        num_experts,
+        activation_type,
+        fuse_act,
+        1.702,
+        7.0,
+    )
+
+    # Fused MXFP4 path.
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35_mxfp4_w4a16(
         inputs["output_mxfp4"],
         inputs["activations"],
         inputs["w_packed"],
