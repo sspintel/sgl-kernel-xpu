@@ -20,6 +20,9 @@ def cpu_ref(
     cache_seqlens,
     seqlen_q,
     softmax_scale,
+    window_size=(-1, -1),
+    causal=False,
+    sinks=None,
     upcast=False,
 ):
     """
@@ -33,6 +36,9 @@ def cpu_ref(
         cache_seqlens: (batch,) - cache length per batch
         seqlen_q: query sequence length
         softmax_scale: scaling factor for attention
+        window_size: local attention window, inclusive, on the query row index
+        causal: whether to force right window size to 0
+        sinks: optional per-head sink scores
         upcast: whether to upcast to fp32 for computation
 
     Returns:
@@ -43,12 +49,17 @@ def cpu_ref(
 
     dtype = q.dtype
 
-    # Move everything to CPU for reference computation
     q = q.cpu()
     k_cache = k_cache.cpu()
     v_cache = v_cache.cpu()
     page_table = page_table.cpu()
     cache_seqlens = cache_seqlens.cpu()
+    sinks = sinks.cpu() if isinstance(sinks, torch.Tensor) else sinks
+
+    if isinstance(window_size, torch.Tensor):
+        window_size = tuple(int(w) for w in window_size)
+    if causal:
+        window_size = (window_size[0], 0)
 
     if upcast:
         q_compute = q.float()
@@ -64,57 +75,65 @@ def cpu_ref(
     )
 
     for b in range(batch):
-        # Get cache seqlen for this batch
         cache_len = cache_seqlens[b].item()
+        page_indices = page_table[b]
 
-        # Get the page indices for this batch
-        page_indices = page_table[b]  # (num_pages_per_seq,)
-
-        # Reconstruct k, v from pages
         k_seq = []
         v_seq = []
         for page_idx in page_indices:
             if len(k_seq) * page_size >= cache_len:
                 break
-            k_page = k_cache_compute[
-                page_idx.item()
-            ]  # (page_size, num_heads_kv, head_dim)
-            v_page = v_cache_compute[page_idx.item()]
-            k_seq.append(k_page)
-            v_seq.append(v_page)
+            k_seq.append(k_cache_compute[page_idx.item()])
+            v_seq.append(v_cache_compute[page_idx.item()])
 
         if len(k_seq) == 0:
             continue
 
-        # Concatenate pages and trim to cache_len
-        k_full = torch.cat(
-            k_seq, dim=0
-        )  # (page_size * num_pages, num_heads_kv, head_dim)
-        v_full = torch.cat(v_seq, dim=0)
+        k_full = torch.cat(k_seq, dim=0)[:cache_len]
+        v_full = torch.cat(v_seq, dim=0)[:cache_len]
+        q_batch = q_compute[b]
 
-        k_full = k_full[:cache_len]  # (cache_len, num_heads_kv, head_dim)
-        v_full = v_full[:cache_len]
-
-        q_batch = q_compute[b]  # (seqlen_q, num_heads_q, head_dim)
-
-        # Compute attention for this batch
         for h in range(num_heads_q):
-            # Get head index for KV (handle GQA)
-            h_kv = h % num_heads_kv if num_heads_kv > 0 else 0
+            # GQA mapping: contiguous groups of Q heads share one KV head.
+            # Example: nheads_q=4, nheads_kv=2 -> [0, 0, 1, 1].
+            group_size = num_heads_q // num_heads_kv if num_heads_kv > 0 else 1
+            h_kv = h // group_size if num_heads_kv > 0 else 0
+            q_head = q_batch[:, h, :]
+            k_head = k_full[:, h_kv, :]
+            v_head = v_full[:, h_kv, :]
 
-            q_head = q_batch[:, h, :]  # (seqlen_q, head_dim)
-            k_head = k_full[:, h_kv, :]  # (cache_len, head_dim)
-            v_head = v_full[:, h_kv, :]  # (cache_len, head_dim)
+            scores = torch.matmul(q_head, k_head.t()) * softmax_scale
 
-            # Compute attention scores
-            scores = (
-                torch.matmul(q_head, k_head.t()) * softmax_scale
-            )  # (seqlen_q, cache_len)
+            if window_size[0] >= 0 or window_size[1] >= 0:
+                local_mask = torch.ones_like(scores, dtype=torch.bool)
+                left_window, right_window = window_size
+                for row_idx in range(seqlen_q):
+                    row_kv_idx = row_idx + cache_len - seqlen_q
+                    left_bound = (
+                        0 if left_window < 0 else max(0, row_kv_idx - left_window)
+                    )
+                    right_bound = (
+                        cache_len - 1
+                        if right_window < 0
+                        else min(cache_len - 1, row_kv_idx + right_window)
+                    )
+                    if left_bound <= right_bound:
+                        local_mask[row_idx, left_bound : right_bound + 1] = False
+                scores = scores.masked_fill(local_mask, float("-inf"))
+
+            if sinks is not None:
+                sink_score = sinks[h].to(scores.dtype).view(1, 1).expand(seqlen_q, 1)
+                scores = torch.cat([scores, sink_score], dim=-1)
+
             attn_weights = F.softmax(scores, dim=-1, dtype=q_compute.dtype)
+            if sinks is not None:
+                attn_weights = attn_weights[..., :-1]
+            if window_size[0] >= 0 or window_size[1] >= 0:
+                attn_weights = attn_weights.masked_fill(
+                    torch.all(local_mask, dim=-1, keepdim=True), 0.0
+                )
 
-            # Apply attention to values
-            out_head = torch.matmul(attn_weights, v_head)  # (seqlen_q, head_dim)
-            out[b, :, h, :] = out_head
+            out[b, :, h, :] = torch.matmul(attn_weights, v_head)
 
     if upcast and dtype != torch.float32:
         out = out.to(dtype)
@@ -139,50 +158,64 @@ def is_cri_device() -> bool:
 
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
 @pytest.mark.skipif(not is_cri_device(), reason="Requires a CRI (Xe3P) device")
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 4096),
-        # (128, 128),
-        # (2048, 2048),
-        # (4096, 4096),
-    ],
-)
-def test_flash_attention_xe3_minimal_paged_fwd(seqlen_q, seqlen_k):
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(4, 2)])
+@pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seqlen_q", [1, 128])
+@pytest.mark.parametrize("seqlen_k", [128])
+@pytest.mark.parametrize("page_size", [128, 64])
+@pytest.mark.parametrize("batch", [2])
+def test_flash_attention_xe3_fwd(
+    batch,
+    seqlen_q,
+    seqlen_k,
+    head_dim,
+    page_size,
+    causal,
+    local,
+    use_sinks,
+    nheads_q,
+    nheads_kv,
+):
+
     device = torch.device("xpu")
     dtype = torch.bfloat16
 
-    batch = 16
-    num_heads_q = 2
-    num_heads_kv = 1
-    head_dim = 128
-    page_size = 128
+    if use_sinks and head_dim != 64:
+        pytest.skip("use_sinks is only covered for head_dim == 64 in Xe3 minimal UT")
+
+    if local and seqlen_q == 1:
+        pytest.skip("local-window coverage uses seqlen_q > 1")
+
+    window_size = (1, 0) if local else (-1, -1)
+    case_name = (
+        f"b{batch}_q{seqlen_q}_k{seqlen_k}_d{head_dim}_p{page_size}"
+        f"_causal{int(causal)}_local{int(local)}_sink{int(use_sinks)}"
+    )
+
     num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
     num_pages = batch * num_pages_per_seq
 
     torch.manual_seed(0)
-    q = torch.randn(batch, seqlen_q, num_heads_q, head_dim, device=device, dtype=dtype)
+    q = torch.randn(batch, seqlen_q, nheads_q, head_dim, device=device, dtype=dtype)
     k_cache = torch.randn(
-        num_pages, page_size, num_heads_kv, head_dim, device=device, dtype=dtype
+        num_pages, page_size, nheads_kv, head_dim, device=device, dtype=dtype
     )
     v_cache = torch.randn(
-        num_pages, page_size, num_heads_kv, head_dim, device=device, dtype=dtype
+        num_pages, page_size, nheads_kv, head_dim, device=device, dtype=dtype
     )
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).view(batch, num_pages_per_seq)
-    cache_seqlens = torch.full(
-        (batch,), seqlen_k, dtype=torch.int32, device=device
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+        batch, num_pages_per_seq
     )
+    cache_seqlens = torch.full((batch,), seqlen_k, dtype=torch.int32, device=device)
     softmax_scale = head_dim**-0.5
+    sinks = torch.randn(nheads_q, device=device, dtype=dtype) if use_sinks else None
 
-    # Reference test_flash_attn_kvcache varlen path: cu_seqlens_q from unpad_input
-    # (cumulative per-batch query lengths) and q passed as 3D (total_q, nheads, d).
-    # With a full (no padding) batch this is arange(batch+1) * seqlen_q.
     cu_seqlens_q = (
         torch.arange(0, batch + 1, dtype=torch.int32, device=device) * seqlen_q
     )
-    q_unpad = q.view(batch * seqlen_q, num_heads_q, head_dim)
+    q_unpad = q.view(batch * seqlen_q, nheads_q, head_dim)
 
     out, *_ = flash_attn_with_kvcache(
         q_unpad,
@@ -194,40 +227,49 @@ def test_flash_attention_xe3_minimal_paged_fwd(seqlen_q, seqlen_k):
         max_seqlen_q=seqlen_q,
         max_seqlen_k=seqlen_k,
         softmax_scale=softmax_scale,
-        causal=False,
-        window_size=(-1, -1),
+        causal=causal,
+        window_size=window_size,
+        sinks=sinks,
         rotary_interleaved=False,
         return_softmax_lse=True,
     )
     torch.xpu.synchronize()
-    # out_kernel = out.view(batch, seqlen_q, num_heads_q, head_dim)
 
-    # out_ref_fp32 = cpu_ref(
-    #     q,
-    #     k_cache,
-    #     v_cache,
-    #     page_table,
-    #     cache_seqlens,
-    #     seqlen_q,
-    #     softmax_scale,
-    #     upcast=True,
-    # )
-    # out_ref_bf16 = cpu_ref(
-    #     q,
-    #     k_cache,
-    #     v_cache,
-    #     page_table,
-    #     cache_seqlens,
-    #     seqlen_q,
-    #     softmax_scale,
-    #     upcast=False,
-    # )
-    # kernel_diff = (out_kernel.float().cpu() - out_ref_fp32).abs().max().item()
-    # baseline_diff = (out_ref_bf16 - out_ref_fp32).abs().max().item()
-    # tol = 2.0 * baseline_diff + 1e-5
-    # print("kernel_diff:", kernel_diff, "baseline_diff:", baseline_diff, "tol:", tol)
+    out_ref_fp32 = cpu_ref(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        softmax_scale,
+        window_size=window_size,
+        causal=causal,
+        sinks=sinks,
+        upcast=True,
+    )
+    out_ref_bf16 = cpu_ref(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        seqlen_q,
+        softmax_scale,
+        window_size=window_size,
+        causal=causal,
+        sinks=sinks,
+        upcast=False,
+    )
+    out_kernel = out.view(batch, seqlen_q, nheads_q, head_dim)
+    kernel_diff = (out_kernel.float().cpu() - out_ref_fp32).abs().max().item()
+    baseline_diff = (out_ref_bf16 - out_ref_fp32).abs().max().item()
+    tol = 2.0 * baseline_diff + 1e-5
+    assert kernel_diff <= tol, (
+        f"Xe3 flash attention case={case_name} failed: kernel_diff={kernel_diff} > tol={tol} "
+        f"(baseline={baseline_diff})"
+    )
 
-    # assert kernel_diff <= tol, (
-    #     f"Xe3 minimal flash attention failed: kernel_diff={kernel_diff} > tol={tol} "
-    #     f"(baseline={baseline_diff})"
-    # )
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

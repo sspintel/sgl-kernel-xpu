@@ -504,10 +504,12 @@ def generate_qkv(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1), (16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("causal,local", [(False, False)])
-@pytest.mark.parametrize("use_sinks", [False])
+@pytest.mark.parametrize(
+    "causal,local", [(False, False), (False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
@@ -521,7 +523,7 @@ def generate_qkv(
         else [0.0]
     ),
 )
-@pytest.mark.parametrize("page_size", [128])
+@pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
@@ -530,6 +532,8 @@ def generate_qkv(
     "seqlen_q,seqlen_k",
     [
         # (4096, 4096),
+        (64, 1024),
+        (64, 4096),
         (128, 128),
     ],
 )
@@ -999,10 +1003,11 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1), (16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize(
+    "causal,local", [(False, False), (False, True), (True, False), (True, True)]
+)
 @pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1017,18 +1022,20 @@ def test_flash_attn_kvcache(
         else [0.0]
     ),
 )
-@pytest.mark.parametrize("page_size", [128])
+@pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen_q", [1])
-@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
         128,
         256,
+        1024,
+        4096,
     ],
 )
 def test_flash_attn_decode_kvcache(

@@ -149,6 +149,7 @@ struct PackedFP8PReorder {
 template <
     class DispatchPolicy_,
     bool CausalMask_,
+    bool LocalMask_,
     bool BlockScale_,
     bool F8kvF16mma_,
     bool PerTensorScale_,
@@ -179,6 +180,7 @@ struct FMHAFwdMainloop {
 template <
     int Stages,
     bool CausalMask_,
+    bool LocalMask_,
     bool BlockScale_,
     bool F8kvF16mma_,
     bool PerTensorScale_,
@@ -203,6 +205,7 @@ template <
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
+    LocalMask_,
     BlockScale_,
     F8kvF16mma_,
     PerTensorScale_,
@@ -312,6 +315,7 @@ struct FMHAFwdMainloop<
   using ElementA = typename TiledMMAPV::ValTypeD;
 
   static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool LocalMask = LocalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
 
@@ -362,6 +366,8 @@ struct FMHAFwdMainloop<
     // Under PagedKV the physical tile index can address any page in the pool,
     // so the cache tensor must span the whole pool, not just seq_len_kv_cache.
     int total_seqlen_kv = 0;
+    int window_size_left = -1;
+    int window_size_right = -1;
   };
 
   // Kernel-facing parameters
@@ -381,7 +387,14 @@ struct FMHAFwdMainloop<
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq, args.total_seqlen_kv};
+    return Params{
+        val,
+        args.ptr_page_table,
+        args.page_size,
+        args.num_pages_per_seq,
+        args.total_seqlen_kv,
+        args.window_size_left,
+        args.window_size_right};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -413,6 +426,7 @@ struct FMHAFwdMainloop<
       int l_coord,
       int full_tile_offset,
       int discard_seq_coord,
+      int causal_k_block_start = 0,
       int q_pos_base = 0,  // Tile-row offset of this block (GQA fusion / spec-decode)
       int gqa_fusion_q_per_head = 0,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
@@ -849,9 +863,23 @@ struct FMHAFwdMainloop<
           prefetch(tiled_prefetch_scaleV, prefetch_iter_scaleV(_, _, _, K - kblocks_cache));
         }
       }
-      /* Causal masking - only in non-cache mode */
-      if constexpr (!is_cache && CausalMask) {
-        if (K == total_blk - 1) {
+      /* Causal masking */
+      if constexpr (CausalMask) {
+        if constexpr (is_cache) {
+          if (K >= causal_k_block_start) {
+            Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+            Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+            auto cS_thread = thr_mma_qk.partition_C(gP);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              int row_idx = get<0>(cS_thread(i));
+              int col_idx = get<1>(cS_thread(i));
+              if (col_idx > full_tile_offset + row_idx) {
+                tSrS(i) = ElementS(-INFINITY);
+              }
+            }
+          }
+        } else if (K == total_blk - 1) {
           // Need to get global col and row indices to mask the elements.
           // Use the logical new-KV tile index (K - kblocks_cache) so that
           // col_idx correctly reflects the position within the new-KV segment
@@ -869,6 +897,28 @@ struct FMHAFwdMainloop<
             int col_idx = get<1>(cS_thread(i)) + seq_len_kv_cache;
             int seq_coord = (gqa_fusion_q_per_head > 0) ? ((q_pos_base + row_idx) % gqa_fusion_q_per_head) : row_idx;
             if (col_idx - seq_len_kv_cache - full_tile_offset > seq_coord - discard_seq_coord) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
+        }
+      }
+      if constexpr (LocalMask) {
+        // A full-coverage local window is equivalent to plain attention.
+        // Window size of -1 indicates infinite window (no masking).
+        // Skip local masking in this case to avoid perturbing score fragments.
+        const bool full_window = (params.window_size_left < 0) && (params.window_size_right < 0);
+        if (!full_window) {
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            const int row_idx = get<0>(cS_thread(i));
+            const int col_idx = get<1>(cS_thread(i));
+            const int row_kv_idx = (GqaFusion ? 0 : row_idx) + full_tile_offset;
+            const bool left_mask = col_idx < row_kv_idx - params.window_size_left;
+            const bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+            if (left_mask || right_mask) {
               tSrS(i) = ElementS(-INFINITY);
             }
           }
@@ -1054,7 +1104,8 @@ struct FMHAFwdMainloop<
 
     /* Main loop, blocked in k. */
     if constexpr (CachedKV) {
-      for (int K = blk_k0; K < kblocks_cache; K++) {
+      // Keep cache iteration in [blk_k0, blk_k1) to match xe2 local pruning.
+      for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
         mainloop_body(
             std::bool_constant<true>{},
             K,

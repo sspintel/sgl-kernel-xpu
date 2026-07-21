@@ -50,7 +50,8 @@ template <
     class CollectiveMainloop,  // Attention mainloop
     class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,            // 2D slice of global output tensor
-    class TiledCopyO_ = void>  // Optional TiledCopy for loading O
+    class TiledCopyO_ = void,  // Optional TiledCopy for loading O
+    bool Sink_ = false>
 class FMHAFwdEpilogue {
  public:
   //
@@ -68,6 +69,8 @@ class FMHAFwdEpilogue {
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
   using ElementA = typename FragA::value_type;
+  using ElementSink = typename CollectiveMainloop::TensorQ::element_type;
+  static constexpr bool Sink = Sink_;
 
   // Split k-reduced tiles between participating subgroups.
   // Assumption: the A tile is contiguous.
@@ -133,14 +136,14 @@ class FMHAFwdEpilogue {
 
   template <bool SumIsReduced = false, typename QVCoord, typename FragSPRow>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,      // Global O tensor: (q,v)
-      FragA& tArA,             // O accumulator:   (q,v)
-      FragARow& tA_max,        // Softmax row-wise max accumulator
-      FragSPRow& tA_sum,       // Softmax row-wise partial sum (per-lane, deferred hreduce)
-      QVCoord blk_qv,          // WG tile indices: (q,v)
-      int thr_id,              // Work-item ID
-      float v_scale = 1.0f) {  // Per-tensor V dequant scale (fp8 path)
-
+      TensorO2D const& O,    // Global O tensor: (q,v)
+      FragA& tArA,           // O accumulator:   (q,v)
+      FragARow& tA_max,      // Softmax row-wise max accumulator
+      FragSPRow& tA_sum,     // Softmax row-wise partial sum (per-lane, deferred hreduce)
+      QVCoord blk_qv,        // WG tile indices: (q,v)
+      int thr_id,            // Work-item ID
+      float v_scale = 1.0f,  // Per-tensor V dequant scale (fp8 path)
+      ElementSink sink_val = ElementSink{}) {
     using namespace cute;
     using ElementA = typename FragA::element_type;
     auto tA_sum_full = [&]() -> decltype(auto) {
@@ -151,10 +154,20 @@ class FMHAFwdEpilogue {
     }();
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
+    auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum_full, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    if constexpr (Sink) {
+      constexpr double kLog2e = 1.4426950408889634074;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); ++i) {
+        if (rA_sum(i) != ElementA(0)) {
+          rA_sum(i) += sycl::native::exp2(static_cast<ElementA>(sink_val * kLog2e) - rA_max(i));
+        }
+      }
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -195,7 +208,7 @@ class FMHAFwdEpilogue {
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_max, tA_sum, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -296,7 +309,7 @@ class FMHAFwdEpilogue {
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_max, rA_sum, active);
     }
   }
 };
