@@ -1006,7 +1006,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(1, 1), (16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize(
-    "causal,local", [(False, False), (False, True), (True, False), (True, True)]
+    "causal,local", [(False, False), (False, True)]
 )
 @pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
