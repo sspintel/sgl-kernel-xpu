@@ -82,6 +82,7 @@ jobs:
               python3 bench_embedding_lora_a_fwd.py 2>&1 | tee bench_embedding_lora_a_fwd.py.log \
               python3 bench_moe_mxfp4_w4a16_gemm.py 2>&1 | tee bench_moe_mxfp4_w4a16_gemm.py.log \
               python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log \
+              python3 bench_sgemm_lora_a_fwd.py 2>&1 | tee bench_sgemm_lora_a_fwd.py.log \
             "
 
       - name: Copy logs from container

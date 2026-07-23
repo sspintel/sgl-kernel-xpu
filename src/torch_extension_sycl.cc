@@ -285,6 +285,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+#if SYCL_INTEL_TARGET == 20 || SYCL_INTEL_TARGET == 35
+  m.def(
+      "sgemm_lora_a_fwd(Tensor! output, Tensor input_x, Tensor weights, int stack_num, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor? seg_lens) -> ()");
+  m.impl("sgemm_lora_a_fwd", torch::kXPU, &sgemm_lora_a_fwd);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)
