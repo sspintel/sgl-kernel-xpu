@@ -52,7 +52,7 @@ struct MXFP4Types {
   static constexpr int BlockSize = 32;
   static constexpr int TileK     = 64;
 
-  // Gmem copy atoms (void = auto-select)
+  // Void selects CUTLASS's block-2D auto-detection path.
   using GmemTiledCopyA      = void;
   using GmemTiledCopyB      = void;
   using GmemTiledCopyScaleA = void;
@@ -106,9 +106,10 @@ struct MXFP4Types {
       cute::tuple<ElementInputB, ElementScale>,
       cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScaleB*>,
       TiledMma,
-      cute::tuple<GmemTiledCopyA, GmemTiledCopyScaleA>,
+      // cute::type_list — see equivalent comment in blockwise_moe_mxfp8.cpp.
+      cute::type_list<GmemTiledCopyA, GmemTiledCopyScaleA>,
       void, void, cute::identity,
-      cute::tuple<GmemTiledCopyB, GmemTiledCopyScaleB>,
+      cute::type_list<GmemTiledCopyB, GmemTiledCopyScaleB>,
       void, void, cute::identity>;
 
 
@@ -214,8 +215,8 @@ void mxfp4_blockwise_scaled_grouped_mm(
     scales_a_t_keep_alive = torch::empty({E, scale_cols, max_m}, opts_u8);
     scales_b_t_keep_alive = torch::empty({E, scale_cols, N}, opts_u8);
 
-    launch_mxfp4_build_pointers_and_transpose_scales_flat(
-        q, E, max_m, scale_cols, N, packed_K, static_cast<int>(o_elem),
+    launch_u8_scale_build_pointers_and_transpose_scales_flat(
+        q, E, max_m, scale_cols, N, /*a_row_stride_bytes=*/packed_K, static_cast<int>(o_elem),
         problem_sizes.data_ptr<int32_t>(),
         expert_offsets.data_ptr<int32_t>(),
         scales_a.data_ptr<uint8_t>(),
@@ -231,7 +232,7 @@ void mxfp4_blockwise_scaled_grouped_mm(
         scales_a.stride(0),
         scales_a_t_keep_alive.stride(0));
 
-    launch_mxfp4_transpose_b_scales(
+    launch_u8_transpose_b_scales(
         q, E, N, scale_cols,
         scales_b.data_ptr<uint8_t>(),
         scales_b_t_keep_alive.data_ptr<uint8_t>());

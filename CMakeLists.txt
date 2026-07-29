@@ -82,12 +82,7 @@ if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_TAG  "525faea3f0f43a8aec2d21a70d44111db639a3a9")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
-  # 8de697f18 (Jul 2 2026, PR #755): moves the `Base` typedef in
-  # xe_array_mma_blockscaled_{native,fallback}.hpp from private to public,
-  # required for blockwise_moe_{mxfp4,mxfp8}.cpp to compile. Also carries
-  # cute/arch/quantize_xe.hpp (from 1e7e39b07) — Xe35 fused-VISA quantize atoms
-  # used by the SIMD-16 E4M3 dispatch in per_token_group_quant_8bit{,_v2}.cpp.
-  set(CUTLASS_SYCL_TAG  "8de697f181b39ecec3878b3dcfd6f106dfcdbfac")
+  set(CUTLASS_SYCL_TAG  "08168df2a18224f0ffc638d3a9d71baa16c3a7cb")
 elseif(DPCPP_SYCL_TARGET MATCHES "jgs")
   set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
   set(CUTLASS_SYCL_TAG  "439fd778b16de695d388eb9efc67b88c94828a3f")

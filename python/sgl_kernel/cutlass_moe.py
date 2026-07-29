@@ -1,9 +1,9 @@
 """CUTLASS-based fused MoE wrapper for Intel XPU.
 
 Signature-compatible with sglang's CUDA cutlass_fused_experts_fp8. CUDA-only
-args (*_strides, *_ptrs, use_mxfp8, enable_es) are accepted but unused: XPU's
-fp8_blockwise_scaled_grouped_mm builds the pointer table and transposes
-A-scales on device when given empty int64 ptr-array sentinels.
+args (*_strides, *_ptrs, enable_es) are unused on XPU. `use_mxfp8` selects
+between DSV3-style FP8 (BS=128, fp32 scales) and OCP MXFP8 (BS=32, UE8M0
+uint8 scales); C++ dispatches on scales_a dtype.
 """
 
 from typing import Optional, Tuple
@@ -25,6 +25,8 @@ from sgl_kernel.moe import (
 _FP8_E4M3_MIN = -448.0
 _FP8_E4M3_MAX = 448.0
 
+_MXFP8_BLOCK_SIZE = 32
+
 
 def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
     """Per-token group quant along last dim. Returns (x_q fp8_e4m3, x_s fp32)."""
@@ -44,6 +46,31 @@ def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
         False,
         None,
         False,
+    )
+    return out_q, out_s
+
+
+def _per_token_group_quant_mxfp8(x: torch.Tensor, group_size: int = _MXFP8_BLOCK_SIZE):
+    """MXFP8 per-token group quant. Returns (x_q float8_e4m3fn, x_s uint8 UE8M0).
+
+    Uses v1 (enable_v2=False): v2 does not support row-major UE8M0 output.
+    """
+    assert x.shape[-1] % group_size == 0
+    out_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    out_s_shape = (*x.shape[:-1], x.shape[-1] // group_size)
+    out_s = torch.empty(out_s_shape, device=x.device, dtype=torch.uint8)
+    sgl_per_token_group_quant_8bit(
+        x,
+        out_q,
+        out_s,
+        group_size,
+        1e-10,
+        _FP8_E4M3_MIN,
+        _FP8_E4M3_MAX,
+        True,  # scale_ue8m0
+        False,
+        None,
+        False,  # enable_v2 (v1 supports row-major UE8M0; v2 does not)
     )
     return out_q, out_s
 
@@ -77,14 +104,14 @@ def cutlass_fused_experts_fp8(
     """Fused MoE on Intel XPU.
 
     Mirrors sglang's CUDA cutlass_fused_experts_fp8 signature; CUDA-only args
-    (*_strides, *_ptrs, use_mxfp8, enable_es) are unused on XPU.
+    (*_strides, *_ptrs, enable_es) are unused on XPU.
 
     Weights expected in (E, N, K) row-major: w1=(E, n*2, k), w2=(E, k, n).
-    Sglang's dispatcher applies .transpose(1, 2) before calling, producing
-    (E, k, n*2) and (E, n, k); auto-detected and undone below.
+    MXFP8 scales are (E, n*2, k/32) and (E, k, n/32) un-transposed row-major;
+    the kernel transposes B-scales on device. Sglang's dispatcher applies
+    .transpose(1, 2) before calling; auto-detected and undone below.
     """
     assert use_fp8_blockscale, "Only support fp8 blockscale on XPU"
-    assert not use_mxfp8, "use_mxfp8 (SM100 path) is CUDA-only"
     assert enable_es == (False, False), "enable_es is CUDA-only"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.float8_e4m3fn
@@ -92,6 +119,14 @@ def cutlass_fused_experts_fp8(
     assert w1_q.dim() == 3 and w2_q.dim() == 3, "Weights must be 3D"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert count mismatch w1/w2"
     assert a.dtype in (torch.half, torch.bfloat16), "Invalid input dtype"
+    if use_mxfp8:
+        assert (
+            w1_scale.dtype == torch.uint8 and w2_scale.dtype == torch.uint8
+        ), "use_mxfp8=True requires uint8 UE8M0 weight scales"
+    else:
+        assert (
+            w1_scale.dtype == torch.float32 and w2_scale.dtype == torch.float32
+        ), "use_mxfp8=False requires fp32 weight scales"
 
     # Detect on w1 only — w2 is ambiguous when intermediate == k_hidden.
     # Sglang transposes both weights+scales together or not at all.
@@ -126,6 +161,34 @@ def cutlass_fused_experts_fp8(
     topk = topk_ids.size(1)
     device = a.device
 
+    if use_mxfp8:
+        # MXFP8 gating (mirrors CUDA use_mxfp8 checks).
+        from sgl_kernel import is_xe3_arch
+
+        assert is_xe3_arch(), "MXFP8 requires an Xe3P (CRI) XPU"
+        assert (
+            k % _MXFP8_BLOCK_SIZE == 0
+        ), f"MXFP8 requires hidden size divisible by {_MXFP8_BLOCK_SIZE}, got k={k}"
+        assert (
+            n % _MXFP8_BLOCK_SIZE == 0
+        ), f"MXFP8 requires intermediate size divisible by {_MXFP8_BLOCK_SIZE}, got n={n}"
+        expected_w1_scale_shape = (
+            num_experts,
+            w1_q.shape[1],
+            w1_q.shape[2] // _MXFP8_BLOCK_SIZE,
+        )
+        expected_w2_scale_shape = (
+            num_experts,
+            w2_q.shape[1],
+            w2_q.shape[2] // _MXFP8_BLOCK_SIZE,
+        )
+        assert (
+            w1_scale.shape == expected_w1_scale_shape
+        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {tuple(w1_scale.shape)}"
+        assert (
+            w2_scale.shape == expected_w2_scale_shape
+        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {tuple(w2_scale.shape)}"
+
     a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
 
@@ -155,11 +218,22 @@ def cutlass_fused_experts_fp8(
     if num_experts > 1:
         expert_starts[1:] = torch.cumsum(eo[:-1], dim=0).to(torch.int32)
 
+    # Pass all experts (including zero-M) directly. The Xe group tile
+    # scheduler skips zero-M groups at runtime via ceil_div(0, BLK_M) = 0
+    # (xe_tile_scheduler_group.hpp), so the mainloop never runs for them.
+    # The driver bypasses sycl-tla's spurious M==0 reject in
+    # can_implement — see blockwise_moe_runner.hpp for details.
+
     # Scatter then quantize. scatter_tokens_to_experts uses c_map (the
     # src->dst permutation) to gather per-expert rows.
     rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
     scatter_tokens_to_experts(a, c_map, rep_a)
-    rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
+    if use_mxfp8:
+        rep_a_q, rep_a1_scales = _per_token_group_quant_mxfp8(
+            rep_a, group_size=_MXFP8_BLOCK_SIZE
+        )
+    else:
+        rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
 
     c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
 
@@ -192,7 +266,14 @@ def cutlass_fused_experts_fp8(
     intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
     silu_and_mul(c1.to(out_dtype), intermediate)
 
-    intermediate_q, a2_scale = _per_token_group_quant_fp8(intermediate, group_size=128)
+    if use_mxfp8:
+        intermediate_q, a2_scale = _per_token_group_quant_mxfp8(
+            intermediate, group_size=_MXFP8_BLOCK_SIZE
+        )
+    else:
+        intermediate_q, a2_scale = _per_token_group_quant_fp8(
+            intermediate, group_size=128
+        )
 
     c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
     fp8_blockwise_scaled_grouped_mm(

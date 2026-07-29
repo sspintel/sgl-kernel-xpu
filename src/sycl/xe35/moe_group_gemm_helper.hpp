@@ -12,10 +12,10 @@
                                         NVFP4 2D-flat adapter (cutlass_fp4_group_mm)
       BuildPointersAndTransposeScalesMxFp8Flat — fp32-A-scale transpose + ptr-build for the
                                         MXFP8/FP8 flat-2D path with ragged m_i
-      BuildPointersAndTransposeScalesMxFp4Flat — UE8M0-A-scale transpose + ptr-build for the
-                                        MXFP4 flat-2D path with ragged m_i
-      TransposeScalesMxFp4B           — UE8M0 B-scale transpose for MXFP4 (E, N, scale_cols)
-                                        -> (E, scale_cols, N), runs once per call
+      BuildPointersAndTransposeScalesU8Flat — u8-A-scale transpose + ptr-build for
+                                        flat-2D u8-scale paths (MXFP4, MXFP8).
+      TransposeScalesU8B              — u8 B-scale transpose (E, N, cols) ->
+                                        (E, cols, N). Used by MXFP4 and MXFP8.
 */
 
 #pragma once
@@ -38,11 +38,11 @@ class TransposeScalesAndBuildPointers;
 /// expert_offsets[]).
 class BuildPointersAndTransposeScalesMxFp8Flat;
 
-/// Tag for the MXFP4 flat-layout combined ptr-build + A-scale transpose kernel.
-class BuildPointersAndTransposeScalesMxFp4Flat;
+/// u8-A-scale ptr-build + A-scale transpose (MXFP4 and MXFP8).
+class BuildPointersAndTransposeScalesU8Flat;
 
-/// Tag for the MXFP4 B-scale transpose kernel.
-class TransposeScalesMxFp4B;
+/// u8 B-scale transpose (MXFP4 and MXFP8).
+class TransposeScalesU8B;
 
 // ---------------------------------------------------------------------------
 // Helper 1: fill {5, num_experts} int64 ptr_table from 3D uniform tensors.
@@ -228,15 +228,15 @@ inline void launch_mxfp8_build_pointers_and_transpose_scales_flat(
   });
 }
 
-// MXFP4 flat-2D variant of helper 3: A=uint8 packed (K/2), scales=UE8M0 uint8.
-// a_scales_in (sum_m_i, scale_cols) row-major; a_scales_out (E, scale_cols, max_m) padded.
-inline void launch_mxfp4_build_pointers_and_transpose_scales_flat(
+// u8-A / u8-A-scale variant of helper 3 (MXFP4, MXFP8). a_row_stride_bytes
+// is a.size(1) in bytes (packed_k for MXFP4, k for MXFP8; A is uint8 in both).
+inline void launch_u8_scale_build_pointers_and_transpose_scales_flat(
     sycl::queue& queue,
     int num_experts,
     int max_m,
     int scale_cols,
     int n,
-    int packed_k,
+    int a_row_stride_bytes,
     int out_elem_bytes,
     const int32_t* problem_sizes_ptr,
     const int32_t* expert_offsets_ptr,
@@ -254,7 +254,7 @@ inline void launch_mxfp4_build_pointers_and_transpose_scales_flat(
     int64_t a_scales_in_row_stride_elems,
     int64_t a_scales_out_stride_elems) {
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<BuildPointersAndTransposeScalesMxFp4Flat>(
+    cgh.parallel_for<BuildPointersAndTransposeScalesU8Flat>(
         sycl::range<2>(static_cast<size_t>(num_experts), static_cast<size_t>(max_m)), [=](sycl::id<2> id) {
           const int expert_idx = static_cast<int>(id[0]);
           const int row = static_cast<int>(id[1]);
@@ -262,8 +262,9 @@ inline void launch_mxfp4_build_pointers_and_transpose_scales_flat(
           if (row == 0) {
             const int64_t ei = static_cast<int64_t>(expert_idx);
             const int64_t row_off = static_cast<int64_t>(expert_offsets_ptr[expert_idx]);
-            // A is uint8 (1 byte/elem), row stride = packed_k.
-            ptr_table_ptr[0 * num_experts + expert_idx] = a_base + row_off * static_cast<int64_t>(packed_k);
+            // A is uint8 (1 byte/elem); row stride is a_row_stride_bytes (=
+            // packed_k for MXFP4, k for MXFP8).
+            ptr_table_ptr[0 * num_experts + expert_idx] = a_base + row_off * static_cast<int64_t>(a_row_stride_bytes);
             ptr_table_ptr[1 * num_experts + expert_idx] = b_base + ei * b_stride;
             ptr_table_ptr[2 * num_experts + expert_idx] = out_base + row_off * static_cast<int64_t>(n) * out_elem_bytes;
             ptr_table_ptr[3 * num_experts + expert_idx] = a_scales_out_base + ei * a_scales_out_stride;
@@ -284,10 +285,9 @@ inline void launch_mxfp4_build_pointers_and_transpose_scales_flat(
   });
 }
 
-// MXFP4 B-scale transpose: (E, N, scale_cols) row-major -> (E, scale_cols, N).
-// MXFP4 StrideScaleB = Stride<_1, N, 0> requires this layout; B is uniform
-// per expert so this is a one-time per-call cost in a separate SYCL launch.
-inline void launch_mxfp4_transpose_b_scales(
+// u8 B-scale transpose: (E, N, cols) -> (E, cols, N). Required by MN-major
+// StrideScaleB. One-time per-call cost since B is uniform per expert.
+inline void launch_u8_transpose_b_scales(
     sycl::queue& queue,
     int num_experts,
     int n,
@@ -295,7 +295,7 @@ inline void launch_mxfp4_transpose_b_scales(
     const uint8_t* b_scales_in_ptr,
     uint8_t* b_scales_out_ptr) {
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<TransposeScalesMxFp4B>(
+    cgh.parallel_for<TransposeScalesU8B>(
         sycl::range<3>(static_cast<size_t>(num_experts), static_cast<size_t>(n), static_cast<size_t>(scale_cols)),
         [=](sycl::id<3> id) {
           const int e = static_cast<int>(id[0]);

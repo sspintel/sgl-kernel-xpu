@@ -3,14 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  **************************************************************************************************/
 /*! \file
-    \brief MXFP8 (E4M3 + fp32 scales, block=128) blockwise grouped GEMM for MoE on Intel XPU (xe35).
-           Software-scaled path.
+    \brief FP8 (DSV3-style, BS=128, fp32 scales, SW-scaled) and MXFP8 (OCP,
+           BS=32, UE8M0 uint8 scales, HW-scaled) blockwise grouped GEMM for MoE
+           on Intel XPU (xe35). Dispatched on scales_a.scalar_type().
 
-    NOTE: CUTE_ENABLE_XE_BLOCK_2D_ASSERT is INTENTIONALLY NOT defined in this TU.
-    The MXFP8 D-store has x offsets that the assert (x % 4 == 0) rejects, but the
-    actual Xe hardware silently handles them — defining the macro here would
-    abort an otherwise correct kernel. Keep this file's CUTE include free of the
-    assert define; the MXFP4 TU defines it for its own (separate) compilation.
+    NOTE: CUTE_ENABLE_XE_BLOCK_2D_ASSERT is intentionally NOT defined here —
+    the FP8 D-store's x-offset trips the assert but the hardware handles it.
 */
 
 // clang-format off
@@ -22,64 +20,65 @@ using namespace cutlass::gemm;
 
 namespace at::native::xpu {
 
-// MXFP8: E4M3 + fp32 scales, block=128, A/B=RowMajor, asymmetric scale strides (A=col-major, B=row-major)
-struct MXFP8Types {
+// Shared type traits for the two blockwise MoE grouped-GEMM configs below.
+// Fixed: E4M3 A/B, row-major A/C/D, column-major B, XE_BDPAS_TT, ElementC=void.
+// Variants provide (ElementScale, StrideScaleB, GroupSize, TileShape, BlockSize);
+// GroupSize as cute::tuple → SW-scaled mainloop, cute::Int → HW-scaled mainloop.
+template <
+    typename ElementScale_,
+    typename StrideScaleB_,
+    typename GroupSize_,
+    typename TileShape_,
+    int BlockSize_>
+struct BlockScaledMoETypes {
+  using ElementInputA = cutlass::float_e4m3_t;
+  using ElementInputB = cutlass::float_e4m3_t;
+  using ElementScale  = ElementScale_;
 
-  using ElementInputA   = cutlass::float_e4m3_t;
-  using ElementInputB   = cutlass::float_e4m3_t;
-  using ElementScale    = float;  // fp32 scale factors
-
-
-  using ElementAccumulator       = float;
-  using ElementComputeEpilogue   = float;
-  using ElementOutput            = float;
-
+  using ElementAccumulator     = float;
+  using ElementComputeEpilogue = float;
+  using ElementOutput          = float;
 
   using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::ColumnMajor;  // B is (N, K) with K-contiguous (PyTorch standard)
+  // B is (N, K) K-contiguous (PyTorch); ColumnMajor gives the same physical
+  // access pattern as the CUTLASS example's RowMajor (K, N) with no transpose.
+  using LayoutB = cutlass::layout::ColumnMajor;
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
-  // Scale strides (asymmetric: A=col-major, B=row-major)
-  using StrideScaleA = cute::Stride<_1, int64_t, int64_t>;
-  using StrideScaleB = cute::Stride<int64_t, _1, int64_t>;
+  using StrideScaleA = cute::Stride<cute::_1, int64_t, int64_t>;
+  using StrideScaleB = StrideScaleB_;
 
-  static constexpr int BlockSize = 128;
-  static constexpr int TileK     = 32;
+  static constexpr int BlockSize = BlockSize_;
 
-
+  // Void selects CUTLASS's block-2D auto-detection path (get_block_2d_copy_*
+  // takes the is_void branch and picks the right atom based on TiledMma).
   using GmemTiledCopyA      = void;
   using GmemTiledCopyB      = void;
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  using TileShape = Shape<_256, _256, Int<TileK>>;
+  using TileShape    = TileShape_;
+  using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
+                                    cute::Stride<cute::_4, cute::_1, cute::_0>>;
 
-  using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
-
-  // TiledMMA (XE_BDPAS_TT + fp32 scales → software scaling path)
-  using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_BDPAS_TT<8, float, ElementInputA>>,
+  using TiledMma = typename cute::TiledMMAHelper<
+      cute::MMA_Atom<cute::XE_BDPAS_TT<8, float, ElementInputA>>,
       cute::Layout<TileShape>,
       ThreadLayout>::TiledMMA;
 
-  // Mainloop dispatch (tuple GroupSize → FP8 block-scaled mainloop)
   static constexpr int PipelineStages = 2;
-  using GroupSizeMNK = cute::tuple<cute::_1, cute::Int<BlockSize>, cute::Int<BlockSize>>;
   using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<
-      PipelineStages, GroupSizeMNK>;
+      PipelineStages, GroupSize_>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
-
 
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
       ElementOutput, ElementComputeEpilogue, ElementAccumulator, ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
   using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
-      EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
+      EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(cute::tile_shape(TiledMma()))>;
 
-  // Collective epilogue (generic group path, no explicit copy atoms).
-  // ElementC=void disables the C source load entirely (alpha=1, beta=0 path);
-  // the default C-load atom was triggering XE_STORE_2D alignment asserts.
+  // ElementC=void (alpha=1, beta=0) — avoids XE_STORE_2D alignment asserts.
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
       TileShape,
@@ -89,8 +88,7 @@ struct MXFP8Types {
       ElementOutput,
       cutlass::gemm::TagToStrideC_t<LayoutD*>,
       FusionCallBacks,
-      void, void>;  // no explicit copy atoms
-
+      void, void>;
 
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
       GEMMDispatchPolicy,
@@ -100,16 +98,19 @@ struct MXFP8Types {
       cute::tuple<ElementInputB, ElementScale>,
       cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScaleB*>,
       TiledMma,
-      cute::tuple<GmemTiledCopyA, GmemTiledCopyScaleA>,
+      // cute::type_list (not cute::tuple / std::tuple) because newer DPCPP's
+      // SYCL kernel-name registrar tries to instantiate this template arg, and
+      // both {cute,std}::tuple<void, void> fail (can't hold void members).
+      // cute::type_list is an empty struct; its std::tuple_element
+      // specialization gives CollectiveMma what it needs at metafunction time.
+      cute::type_list<GmemTiledCopyA, GmemTiledCopyScaleA>,
       void, void, cute::identity,
-      cute::tuple<GmemTiledCopyB, GmemTiledCopyScaleB>,
+      cute::type_list<GmemTiledCopyB, GmemTiledCopyScaleB>,
       void, void, cute::identity>;
-
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       GroupedProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
 
   using StrideA = typename Gemm::GemmKernel::InternalStrideA;
   using StrideB = typename Gemm::GemmKernel::InternalStrideB;
@@ -117,11 +118,32 @@ struct MXFP8Types {
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 };
 
+// FP8: fp32 scales, row-major B-scales, tuple GroupSize → SW-scaled mainloop.
+using FP8Types = BlockScaledMoETypes<
+    /* ElementScale = */ float,
+    /* StrideScaleB = */ cute::Stride<int64_t, cute::_1, int64_t>,
+    /* GroupSize    = */ cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
+    /* TileShape    = */ Shape<_256, _256, _32>,
+    /* BlockSize    = */ 128>;
+
+using FP8Runner = BlockScaledGroupedGemmRunner<FP8Types>;
+
+// MXFP8: UE8M0 scales, MN-major B-scales, integer GroupSize → HW-scaled mainloop.
+using MXFP8Types = BlockScaledMoETypes<
+    /* ElementScale = */ typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
+    /* StrideScaleB = */ cute::Stride<cute::_1, int64_t, int64_t>,
+    /* GroupSize    = */ cute::Int<32>,
+    /* TileShape    = */ Shape<_512, _256, _64>,
+    /* BlockSize    = */ 32>;
+
 using MXFP8Runner = BlockScaledGroupedGemmRunner<MXFP8Types>;
 
 }  // namespace at::native::xpu
 
 
+// Entry point. Dispatches on scales_a dtype: fp32 → FP8Runner, uint8 → MXFP8Runner.
+// Both share the on-device prep path (empty ptr sentinels build the {5, E}
+// ptr table + transpose A-scales); MXFP8 additionally transposes B-scales.
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -153,29 +175,40 @@ void fp8_blockwise_scaled_grouped_mm(
   TORCH_CHECK(output.device().is_xpu(), "Output tensor must be on XPU device");
   TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
 
+  // Both FP8 and MXFP8 require float8_e4m3fn inputs — check once here.
   TORCH_CHECK(
       a.scalar_type() == torch::kFloat8_e4m3fn && b.scalar_type() == torch::kFloat8_e4m3fn,
       "Inputs must be float8_e4m3fn");
-  TORCH_CHECK(
-      scales_a.scalar_type() == torch::kFloat32 && scales_b.scalar_type() == torch::kFloat32,
-      "Scales must be float32");
+
+  // Dispatch: fp32 scales → FP8, uint8 UE8M0 scales → MXFP8.
+  const bool is_mxfp8 = (scales_a.scalar_type() == torch::kUInt8);
+  if (is_mxfp8) {
+    TORCH_CHECK(
+        scales_b.scalar_type() == torch::kUInt8,
+        "MXFP8 (uint8 UE8M0 A-scales) requires uint8 B-scales, got ",
+        scales_b.scalar_type());
+  } else {
+    TORCH_CHECK(
+        scales_a.scalar_type() == torch::kFloat32 && scales_b.scalar_type() == torch::kFloat32,
+        "FP8 (fp32 scales) requires fp32 A/B scales");
+  }
 
   // -----------------------------------------------------------------------
-  // Optional on-device prep (flat 2D layout only):
-  //   When the caller passes empty ptr-array tensors (numel()==0), build the
-  //   {5, E} pointer table and transpose A-scales on device via a single
-  //   SYCL kernel. A=(sum_m_i, K) flat 2D; per-expert rows located via
-  //   expert_offsets[]. B and scales_b stay 3D per-expert.
-  //
-  //   When the caller passes filled ptrs (legacy path), this branch is
-  //   skipped entirely. The public API signature is unchanged either way.
-  // -----------------------------------------------------------------------
-  // Hold device-side ptr_table + transposed-scales scratch to keep them alive
-  // for the duration of the GEMM launch.
+  // Empty ptr sentinels ⇒ on-device prep of {5, E} ptr table and A-scale
+  // transpose (MXFP8 also transposes B-scales to MN-major). Filled ptrs ⇒
+  // legacy caller-managed path (FP8 only — MXFP8 requires the on-device
+  // B-scale transpose so filled-ptr callers would run with un-transposed
+  // scales and produce silently-wrong output).
   torch::Tensor ptr_table_keep_alive;
   torch::Tensor scales_a_t_keep_alive;
+  torch::Tensor scales_b_t_keep_alive;
 
   const bool need_prep = (a_ptrs.numel() == 0);
+  TORCH_CHECK(
+      !is_mxfp8 || need_prep,
+      "MXFP8 requires the on-device prep path (empty int64 ptr-array sentinels). "
+      "The legacy filled-ptrs path does not transpose B-scales to MN-major and "
+      "would produce incorrect results.");
 
   if (need_prep) {
     TORCH_CHECK(a.dim() == 2,
@@ -190,7 +223,8 @@ void fp8_blockwise_scaled_grouped_mm(
                     a_scales_ptrs.numel() == 0 && b_scales_ptrs.numel() == 0,
                 "On-device prep requires all ptr-array tensors to be empty");
 
-    constexpr int BS = at::native::xpu::MXFP8Types::BlockSize;
+    const int BS = is_mxfp8 ? at::native::xpu::MXFP8Types::BlockSize
+                            : at::native::xpu::FP8Types::BlockSize;
     const int E = static_cast<int>(expert_offsets.size(0));
     const int K = static_cast<int>(a.size(1));
     const int N = static_cast<int>(output.size(1));
@@ -199,46 +233,96 @@ void fp8_blockwise_scaled_grouped_mm(
     TORCH_CHECK(scales_a.size(1) == scale_cols,
                 "scales_a flat shape mismatch; expected (*, K/BS) row-major");
 
+    if (is_mxfp8) {
+      TORCH_CHECK(
+          scales_b.size(0) == E && scales_b.size(1) == N &&
+              scales_b.size(2) == scale_cols,
+          "MXFP8 scales_b shape mismatch; expected (E, N, K/BS) row-major un-transposed");
+    }
+
     auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
-    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
     ptr_table_keep_alive = torch::empty({5, E}, opts_i64);
 
     auto& q = at::xpu::getCurrentXPUStream(a.device().index()).queue();
 
-    const int64_t a_elem  = a.element_size();
-    const int64_t b_elem  = b.element_size();
-    const int64_t o_elem  = output.element_size();
-    const int64_t sa_elem = scales_a.element_size();
-    const int64_t sb_elem = scales_b.element_size();
+    // Element sizes are compile-time known: A/B are always fp8_e4m3 (1 B),
+    // output is always fp32 (4 B; enforced in BlockScaledGroupedGemmRunner),
+    // A/B scales are uint8 for MXFP8 or fp32 for FP8.
+    constexpr int64_t a_elem  = sizeof(cutlass::float_e4m3_t);   // 1
+    constexpr int64_t b_elem  = sizeof(cutlass::float_e4m3_t);   // 1
+    constexpr int64_t o_elem  = sizeof(float);                   // 4
+    const int64_t sa_elem = is_mxfp8 ? sizeof(uint8_t) : sizeof(float);
+    const int64_t sb_elem = sa_elem;
 
-    // max_m_i comes from problem_sizes (per-expert M). We need a host-side
-    // value to size the padded transposed scratch buffer.
-    auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
-    const int32_t* psz = problem_sizes_cpu.data_ptr<int32_t>();
-    int max_m = 0;
-    for (int e = 0; e < E; ++e) {
-      if (psz[e * 3] > max_m) max_m = psz[e * 3];
+    // Upper-bound the padded ragged-M A-scales scratch by total flat A rows.
+    // sum(M_i) == a.size(0) by construction (on-device prep requires flat
+    // 2D A), so no single expert's M can exceed a.size(0). Using this bound
+    // instead of the exact max_m avoids a D->H reduction over problem_sizes
+    // and keeps dispatch fully async — matches vLLM's SM100 shape. Trades a
+    // small amount of scratch memory (up to E*scale_cols*(a.size(0) - true
+    // max_m) bytes) for one fewer host sync per fused-experts call.
+    const int max_m = static_cast<int>(a.size(0));
+    TORCH_CHECK(max_m > 0, "flat A must have at least one row");
+
+    // Xe block-2D scale loads require 4-byte aligned width/pitch: pad the
+    // per-column M stride up to ScaleAlignElems = ceil_div(4, sizeof(scale)).
+    // For u8 UE8M0 that's 4; for fp32 it's 1 (already aligned). Also
+    // zero-init so the extra rows don't feed garbage into the accumulator.
+    const int scale_align = is_mxfp8 ? 4 : 1;
+    const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
+
+    if (is_mxfp8) {
+      // uint8 A-scales + uint8 B-scales (both transposed on device).
+      auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
+      scales_a_t_keep_alive = torch::zeros({E, scale_cols, padded_max_m}, opts_u8);
+      scales_b_t_keep_alive = torch::empty({E, scale_cols, N}, opts_u8);
+
+      launch_u8_scale_build_pointers_and_transpose_scales_flat(
+          q, E, padded_max_m, scale_cols, N,
+          /*a_row_stride_bytes=*/K, static_cast<int>(o_elem),
+          problem_sizes.data_ptr<int32_t>(),
+          expert_offsets.data_ptr<int32_t>(),
+          scales_a.data_ptr<uint8_t>(),
+          scales_a_t_keep_alive.data_ptr<uint8_t>(),
+          ptr_table_keep_alive.data_ptr<int64_t>(),
+          reinterpret_cast<int64_t>(a.data_ptr()),
+          reinterpret_cast<int64_t>(b.data_ptr()),     b.stride(0) * b_elem,
+          reinterpret_cast<int64_t>(output.data_ptr()),
+          reinterpret_cast<int64_t>(scales_a_t_keep_alive.data_ptr()),
+              scales_a_t_keep_alive.stride(0) * sa_elem,
+          reinterpret_cast<int64_t>(scales_b_t_keep_alive.data_ptr()),
+              scales_b_t_keep_alive.stride(0) * sb_elem,
+          scales_a.stride(0),
+          scales_a_t_keep_alive.stride(0));
+
+      launch_u8_transpose_b_scales(
+          q, E, N, scale_cols,
+          scales_b.data_ptr<uint8_t>(),
+          scales_b_t_keep_alive.data_ptr<uint8_t>());
+    } else {
+      // fp32 A-scales only (B-scales stay untransposed for FP8 row-major).
+      // padded_max_m == max_m here (scale_align=1) but keep the name for
+      // symmetry with the MXFP8 branch above.
+      auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
+      scales_a_t_keep_alive = torch::zeros({E, scale_cols, padded_max_m}, opts_f32);
+
+      launch_mxfp8_build_pointers_and_transpose_scales_flat(
+          q, E, padded_max_m, scale_cols, N, K,
+          static_cast<int>(a_elem), static_cast<int>(o_elem),
+          problem_sizes.data_ptr<int32_t>(),
+          expert_offsets.data_ptr<int32_t>(),
+          scales_a.data_ptr<float>(),
+          scales_a_t_keep_alive.data_ptr<float>(),
+          ptr_table_keep_alive.data_ptr<int64_t>(),
+          reinterpret_cast<int64_t>(a.data_ptr()),
+          reinterpret_cast<int64_t>(b.data_ptr()),     b.stride(0) * b_elem,
+          reinterpret_cast<int64_t>(output.data_ptr()),
+          reinterpret_cast<int64_t>(scales_a_t_keep_alive.data_ptr()),
+              scales_a_t_keep_alive.stride(0) * sa_elem,
+          reinterpret_cast<int64_t>(scales_b.data_ptr()), scales_b.stride(0) * sb_elem,
+          scales_a.stride(0),
+          scales_a_t_keep_alive.stride(0));
     }
-    TORCH_CHECK(max_m > 0, "max_m must be positive across experts");
-
-    scales_a_t_keep_alive = torch::empty({E, scale_cols, max_m}, opts_f32);
-
-    launch_mxfp8_build_pointers_and_transpose_scales_flat(
-        q, E, max_m, scale_cols, N, K,
-        static_cast<int>(a_elem), static_cast<int>(o_elem),
-        problem_sizes.data_ptr<int32_t>(),
-        expert_offsets.data_ptr<int32_t>(),
-        scales_a.data_ptr<float>(),
-        scales_a_t_keep_alive.data_ptr<float>(),
-        ptr_table_keep_alive.data_ptr<int64_t>(),
-        reinterpret_cast<int64_t>(a.data_ptr()),
-        reinterpret_cast<int64_t>(b.data_ptr()),     b.stride(0) * b_elem,
-        reinterpret_cast<int64_t>(output.data_ptr()),
-        reinterpret_cast<int64_t>(scales_a_t_keep_alive.data_ptr()),
-            scales_a_t_keep_alive.stride(0) * sa_elem,
-        reinterpret_cast<int64_t>(scales_b.data_ptr()), scales_b.stride(0) * sb_elem,
-        scales_a.stride(0),
-        scales_a_t_keep_alive.stride(0));
 
     a_ptrs        = ptr_table_keep_alive[0];
     b_ptrs        = ptr_table_keep_alive[1];
@@ -247,17 +331,25 @@ void fp8_blockwise_scaled_grouped_mm(
     b_scales_ptrs = ptr_table_keep_alive[4];
   }
 
-  // Hand off to the runner. When need_prep ran, scales_a_t_keep_alive holds the
-  // transposed (E, K/BS, max_m) scale tensor; the helper packs each scale
-  // column with stride max_m, so use the override. For the legacy filled-ptrs
-  // path (caller pre-transposed per-expert), pass 0 to preserve the existing
-  // per-expert m_i stride behavior.
+  // On-device-prep: A-scales packed with M-stride max_m ⇒ pass override.
+  // Legacy filled-ptrs path uses per-expert m_i (override = 0).
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
-  at::native::xpu::MXFP8Runner::run(
-      output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-      a, b,
-      need_prep ? scales_a_t_keep_alive : scales_a,
-      scales_b, problem_sizes, expert_offsets, workspace,
-      sa_m_stride_override);
+
+  if (is_mxfp8) {
+    at::native::xpu::MXFP8Runner::run(
+        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+        a, b,
+        need_prep ? scales_a_t_keep_alive : scales_a,
+        need_prep ? scales_b_t_keep_alive : scales_b,
+        problem_sizes, expert_offsets, workspace,
+        sa_m_stride_override);
+  } else {
+    at::native::xpu::FP8Runner::run(
+        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+        a, b,
+        need_prep ? scales_a_t_keep_alive : scales_a,
+        scales_b, problem_sizes, expert_offsets, workspace,
+        sa_m_stride_override);
+  }
 }

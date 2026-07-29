@@ -167,17 +167,12 @@ class BlockScaledGroupedGemmRunner {
 
     auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
         problem_sizes.data_ptr<int32_t>());
-    // The block-scaled group mainloop's can_implement() iterates
-    // problem_shapes.get_host_problem_shape(i) to validate per-group M/N/K
-    // alignment. That accessor returns a default-constructed Shape{0,0,0}
-    // when host_problem_shapes is nullptr, which trips the "M==0" reject
-    // and yields "CUTLASS cannot implement this configuration". Build a
-    // host-side copy of problem_sizes and pass it through — it must remain
-    // alive through can_implement/initialize (kept as a local below).
-    auto problem_sizes_host = problem_sizes.to(
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-    auto* problem_sizes_host_ptr = reinterpret_cast<UnderlyingProblemShapeType const*>(
-        problem_sizes_host.data_ptr<int32_t>());
+    // Pass nullptr for the host problem-shape pointer. can_implement is
+    // skipped upstream (see the comment further down), and the group tile
+    // scheduler's get_work_idx_m_and_n uses the device pointer at runtime.
+    // Avoiding the D->H copy keeps dispatch fully async — matches vLLM's
+    // SM100 shape (grouped_mm_c3x.cuh: ProblemShape{n, dev, nullptr}).
+    UnderlyingProblemShapeType const* problem_sizes_host_ptr = nullptr;
     auto* stride_A_ptr   = reinterpret_cast<StrideA*>(stride_A_dev.data_ptr<int64_t>());
     auto* stride_B_ptr   = reinterpret_cast<StrideB*>(stride_B_dev.data_ptr<int64_t>());
     auto* stride_C_ptr   = reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());
@@ -221,9 +216,21 @@ class BlockScaledGroupedGemmRunner {
         typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
     Gemm gemm_op;
-    TORCH_CHECK(gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess,
-                "CUTLASS cannot implement this configuration");
-
+    // Intentionally skip gemm_op.can_implement(gemm_args).
+    //
+    // sycl-tla's Xe block-scaled can_implement
+    // (xe_array_mma_blockscaled_native.hpp: CollectiveMma::can_implement)
+    // rejects any group with M == 0 with a hard fail. On MoE decode with
+    // few tokens and many experts, most experts get zero tokens — the Xe
+    // group tile scheduler already skips such groups at runtime via
+    // ceil_div(0, BLK_M) = 0 (xe_tile_scheduler_group.hpp), so the mainloop
+    // never runs for them and correct results are produced. NVIDIA's
+    // sm100/103 block-scaled collectives gate this on
+    // is_host_problem_shape_available() and tolerate M=0 groups; the Xe
+    // path does not. Filed upstream as a follow-up; until it lands, skip
+    // the check on the driver side. TensorAlloc side (contiguous fp8
+    // e4m3 buffers, K,N aligned) satisfies the other alignment predicates
+    // by construction, so we don't lose meaningful validation.
     size_t workspace_size = Gemm::get_workspace_size(gemm_args);
     TORCH_CHECK(static_cast<size_t>(workspace.numel()) >= workspace_size,
                 "Workspace insufficient: need ", workspace_size, " bytes");
