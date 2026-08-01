@@ -190,7 +190,10 @@ void fp8_blockwise_scaled_grouped_mm(
   } else {
     TORCH_CHECK(
         scales_a.scalar_type() == torch::kFloat32 && scales_b.scalar_type() == torch::kFloat32,
-        "FP8 (fp32 scales) requires fp32 A/B scales");
+        "FP8 blockwise grouped GEMM requires float32 A/B scales, got scales_a=",
+        scales_a.scalar_type(),
+        " scales_b=",
+        scales_b.scalar_type());
   }
 
   // -----------------------------------------------------------------------
