@@ -145,9 +145,11 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   # Map DPCPP_SYCL_TARGET to AOT_TARGETS and compile definitions
   if(DPCPP_SYCL_TARGET MATCHES "bmg")
-    list(APPEND AOT_TARGETS "bmg_g21")
+    list(APPEND AOT_TARGETS "bmg")
+    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
   elseif(DPCPP_SYCL_TARGET MATCHES "cri")
     list(APPEND AOT_TARGETS "cri")
+    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
     add_compile_definitions(SGL_PRE_SILICON)
   elseif(DPCPP_SYCL_TARGET MATCHES "jgs")
     list(APPEND AOT_TARGETS "xe4")
