@@ -7,11 +7,21 @@ from sgl_kernel import swiglu_gpt_oss_sigmoid_alpha
 
 
 def swiglu_gpt_oss_sigmoid_alpha_ref(x, gemm1_alpha, gemm1_limit):
-    """Reference implementation using native PyTorch"""
-    gate, up = x[..., ::2], x[..., 1::2]
+    """Reference implementation using native PyTorch.
+
+    Compute in fp32 and cast back at the end to mirror the kernel, which
+    upcasts to float, does all math in fp32, and rounds to the input dtype
+    only at the store. Running the whole chain in fp16 on CPU accumulates
+    per-op rounding (sigmoid + two multiplies), which for tail values of
+    ``gate`` (unbounded below) can exceed the 0.1 tolerance on large shapes.
+    """
+    orig_dtype = x.dtype
+    xf = x.to(torch.float32)
+    gate, up = xf[..., ::2], xf[..., 1::2]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+    out = gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+    return out.to(orig_dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -39,9 +49,10 @@ def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dty
     # Verify the outputs match
     atol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4
     rtol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4
+    output_cpu = output.to("cpu")
     assert torch.allclose(
-        output_ref, output.to("cpu"), atol=atol, rtol=rtol
-    ), f"dtype = {dtype}Output mismatch: max_diff={torch.max(torch.abs(output_ref - output))}"
+        output_ref, output_cpu, atol=atol, rtol=rtol
+    ), f"dtype = {dtype}Output mismatch: max_diff={torch.max(torch.abs(output_ref - output_cpu))}"
 
 
 if __name__ == "__main__":
