@@ -67,12 +67,12 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
             set(GENERATED_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_FILE})
 
             set(GENERATED_SPLIT_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_SPLIT_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
         endforeach()
     endforeach()
 endforeach()

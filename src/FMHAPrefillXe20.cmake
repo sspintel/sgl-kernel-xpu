@@ -100,5 +100,5 @@ foreach(HEAD_DIM ${FMHA_PREFILL_HEAD_DIMS})
     set(GENERATED_FILE
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_kernel_${HEAD_DIM}.cpp")
     configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
-    list(APPEND device_cpp_common ${GENERATED_FILE})
+    list(APPEND device_cpp_xe20 ${GENERATED_FILE})
 endforeach()
