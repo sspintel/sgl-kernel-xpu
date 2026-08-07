@@ -86,6 +86,7 @@ jobs:
               python3 bench_min_p_sampling_from_probs.py 2>&1 | tee bench_min_p_sampling_from_probs.py.log \
               python3 bench_hc_pre_gemm_sqr_sum.py 2>&1 | tee bench_hc_pre_gemm_sqr_sum.py.log \
               python3 bench_mhc_pre.py 2>&1 | tee bench_mhc_pre.py.log \
+              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log \
             "
 
       - name: Copy logs from container

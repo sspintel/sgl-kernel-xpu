@@ -48,6 +48,7 @@ suites = {
         TestFile("test_sgemm_lora_a_fwd.py"),
         TestFile("test_hc_pre_gemm_sqr_sum.py"),
         TestFile("test_mhc_pre.py"),
+        TestFile("test_hc_post.py"),
     ],
 }
 
