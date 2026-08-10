@@ -716,6 +716,7 @@ MXFP8_MNK_FACTORS = [
     (256, 256, 256),
     (256, 512, 512),
     (512, 512, 512),
+    (256, 256, 1024),
 ]
 
 # Qwen3-30B-A3B fused-MoE GEMM shapes (K = hidden = 2048).
@@ -843,7 +844,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
             pytest.skip("MXFP8 requires a CRI (Xe3P) device")
 
     @pytest.mark.parametrize("m,n,k", MXFP8_MNK_FACTORS)
-    @pytest.mark.parametrize("num_experts", [2, 4])
+    @pytest.mark.parametrize("num_experts", [2, 4, 8])
     @torch.inference_mode()
     def test_kernel_vs_reference(self, m: int, n: int, k: int, num_experts: int):
         device = "xpu"

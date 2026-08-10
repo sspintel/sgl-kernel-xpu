@@ -96,8 +96,8 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
 # Shape set kept small so the CI simulator can finish it in a reasonable time;
 # each GEMM launch is ~seconds on the CRI simulator.
 @pytest.mark.parametrize("M", [1, 128, 512])
-@pytest.mark.parametrize("N", [128, 256, 512])
-@pytest.mark.parametrize("K", [128, 256, 512])
+@pytest.mark.parametrize("N", [128, 256, 512, 768, 2048, 5120, 8192, 25600, 28672])
+@pytest.mark.parametrize("K", [128, 256, 512, 2048, 5120, 8192])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, device)
