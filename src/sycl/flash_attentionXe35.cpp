@@ -120,11 +120,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
       {static_cast<int64_t>(num_pages) * page_size, static_cast<int64_t>(num_heads_kv), static_cast<int64_t>(head_dim)},
       {v.stride(1), v.stride(2), v.stride(3)});
 
-  auto perf_stream = c10::xpu::getCurrentXPUStream();
-  perf_stream.synchronize();
-  GPU_Clock timer;
-  timer.start();
-
   if (max_seqlen_q == 1) {
     if (head_dim == 64) {
       dispatch_xe35_decode_64(
@@ -222,39 +217,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
           sinks_.has_value());
     }
   }
-
-  xe35_fmha::profiling_queue().wait();
-  const double elapsed_s = timer.seconds();
-
-  const double flops_qk = 2.0 * static_cast<double>(num_heads_q) * static_cast<double>(total_q) *
-                          static_cast<double>(max_seqlen_k) * static_cast<double>(head_dim);
-  const double flops_pv = flops_qk;
-  const double tflops = elapsed_s > 0.0 ? ((flops_qk + flops_pv) * 1e-12) / elapsed_s : 0.0;
-  const double bytes_qk = static_cast<double>(num_heads_q) * static_cast<double>(total_q) *
-                              static_cast<double>(head_dim) * static_cast<double>(q.element_size()) +
-                          static_cast<double>(num_heads_kv) * static_cast<double>(batch) *
-                              static_cast<double>(max_seqlen_k) * static_cast<double>(head_dim) *
-                              static_cast<double>(k.element_size());
-  const double bytes_pv = static_cast<double>(num_heads_kv) * static_cast<double>(batch) *
-                              static_cast<double>(max_seqlen_k) * static_cast<double>(head_dim) *
-                              static_cast<double>(v.element_size()) +
-                          static_cast<double>(num_heads_q) * static_cast<double>(total_q) *
-                              static_cast<double>(head_dim) * static_cast<double>(out_dense.element_size());
-  const double gbps = elapsed_s > 0.0 ? ((bytes_qk + bytes_pv) * 1e-9) / elapsed_s : 0.0;
-  const double mbps = gbps * 1e3;
-  const double gflops = tflops * 1e3;
-  const double elapsed_ms = elapsed_s * 1000.0;
-  const double elapsed_us = elapsed_s * 1e6;
-
-  ::printf(
-      "flash_attentionXe35 perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s (%.3f MB/s), "
-      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
-      elapsed_ms,
-      elapsed_us,
-      gbps,
-      mbps,
-      tflops,
-      gflops);
 
   auto lse = at::zeros({num_heads_q, total_q}, opts.dtype(at::kFloat));
   auto out_accum = at::Tensor();
