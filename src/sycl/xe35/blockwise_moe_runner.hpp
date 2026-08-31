@@ -76,7 +76,10 @@ class BlockScaledGroupedGemmRunner {
       // value (used when scales were packed with stride max_m for padded
       // ragged-M layouts, not per-expert m_i). When 0/default, build the
       // stride from problem_sizes[e][0].
-      int scales_a_m_stride_override = 0) {
+      int scales_a_m_stride_override = 0,
+      // Reuse the caller's D->H copy of problem_sizes when it already made one
+      // for tile-bucket dispatch; otherwise the runner does its own D->H below.
+      const torch::Tensor* problem_sizes_host_opt = nullptr) {
 
     TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3,
                 "problem_sizes must be (num_experts, 3)");
@@ -167,12 +170,30 @@ class BlockScaledGroupedGemmRunner {
 
     auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
         problem_sizes.data_ptr<int32_t>());
-    // Pass nullptr for the host problem-shape pointer. can_implement is
-    // skipped upstream (see the comment further down), and the group tile
-    // scheduler's get_work_idx_m_and_n uses the device pointer at runtime.
-    // Avoiding the D->H copy keeps dispatch fully async — matches vLLM's
-    // SM100 shape (grouped_mm_c3x.cuh: ProblemShape{n, dev, nullptr}).
-    UnderlyingProblemShapeType const* problem_sizes_host_ptr = nullptr;
+    // PersistentTileSchedulerXeGroup falls back to hw_info.sm_count CTAs when
+    // is_host_problem_shape_available() is false (xe_tile_scheduler_group.hpp:187),
+    // over-executing MMA work by ~sm_count/real_tiles when real_tiles < sm_count
+    // (decode / small-M MoE). Xe scheduler gates differently from sm100/103, so
+    // we cannot follow vLLM's ProblemShape{n, dev, nullptr} pattern here.
+    // Host tensor must outlive gemm_op.initialize() + gemm_op.run().
+    torch::Tensor problem_sizes_host_owned;
+    const torch::Tensor* problem_sizes_host_p;
+    if (problem_sizes_host_opt != nullptr) {
+      TORCH_CHECK(problem_sizes_host_opt->device().is_cpu(),
+                  "problem_sizes_host_opt must be a CPU tensor");
+      TORCH_CHECK(problem_sizes_host_opt->scalar_type() == torch::kInt32 &&
+                      problem_sizes_host_opt->dim() == 2 &&
+                      problem_sizes_host_opt->size(1) == 3 &&
+                      problem_sizes_host_opt->size(0) == problem_sizes.size(0),
+                  "problem_sizes_host_opt shape/dtype mismatch");
+      problem_sizes_host_p = problem_sizes_host_opt;
+    } else {
+      problem_sizes_host_owned = problem_sizes.to(torch::kCPU);
+      problem_sizes_host_p = &problem_sizes_host_owned;
+    }
+    UnderlyingProblemShapeType const* problem_sizes_host_ptr =
+        reinterpret_cast<UnderlyingProblemShapeType const*>(
+            problem_sizes_host_p->data_ptr<int32_t>());
     auto* stride_A_ptr   = reinterpret_cast<StrideA*>(stride_A_dev.data_ptr<int64_t>());
     auto* stride_B_ptr   = reinterpret_cast<StrideB*>(stride_B_dev.data_ptr<int64_t>());
     auto* stride_C_ptr   = reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());

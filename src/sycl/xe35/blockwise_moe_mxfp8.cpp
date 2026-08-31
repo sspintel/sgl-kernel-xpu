@@ -67,6 +67,8 @@ struct BlockScaledMoETypes {
       cute::Layout<TileShape>,
       ThreadLayout>::TiledMMA;
 
+  // Stages>2 exceeds L1 residency for these tile sizes on Xe3P CRI; sim sweep
+  // shows +47% LSC bytes / +22% sim HW at Stages=3. See mxfp8_perf_README.md.
   static constexpr int PipelineStages = 2;
   using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<
       PipelineStages, GroupSize_>;
@@ -119,24 +121,66 @@ struct BlockScaledMoETypes {
 };
 
 // FP8: fp32 scales, row-major B-scales, tuple GroupSize → SW-scaled mainloop.
-using FP8Types = BlockScaledMoETypes<
+// K_TILE stays at 32 (GroupSize.K=128 → 4 K-tiles per scale group amortizes the
+// fp32 scale multiply); K_TILE=64 not perf-swept for FP8 yet.
+using FP8Types_decode = BlockScaledMoETypes<
     /* ElementScale = */ float,
     /* StrideScaleB = */ cute::Stride<int64_t, cute::_1, int64_t>,
     /* GroupSize    = */ cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
-    /* TileShape    = */ Shape<_256, _256, _32>,
+    /* TileShape    = */ Shape<_128, _256, _32>,
     /* BlockSize    = */ 128>;
 
-using FP8Runner = BlockScaledGroupedGemmRunner<FP8Types>;
+using FP8Types_step = BlockScaledMoETypes<
+    float,
+    cute::Stride<int64_t, cute::_1, int64_t>,
+    cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
+    Shape<_256, _256, _32>,
+    128>;
+
+using FP8Types_prefill = BlockScaledMoETypes<
+    float,
+    cute::Stride<int64_t, cute::_1, int64_t>,
+    cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
+    Shape<_512, _512, _32>,
+    128>;
+
+using FP8Runner_decode  = BlockScaledGroupedGemmRunner<FP8Types_decode>;
+using FP8Runner_step    = BlockScaledGroupedGemmRunner<FP8Types_step>;
+using FP8Runner_prefill = BlockScaledGroupedGemmRunner<FP8Types_prefill>;
+using FP8Types = FP8Types_step;
 
 // MXFP8: UE8M0 scales, MN-major B-scales, integer GroupSize → HW-scaled mainloop.
-using MXFP8Types = BlockScaledMoETypes<
-    /* ElementScale = */ typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
-    /* StrideScaleB = */ cute::Stride<cute::_1, int64_t, int64_t>,
-    /* GroupSize    = */ cute::Int<32>,
-    /* TileShape    = */ Shape<_512, _256, _64>,
-    /* BlockSize    = */ 32>;
+// Tile shapes bucketed on max(M_i): each CTA computes M_TILE rows and pads any
+// shortfall to zero, so tile-M > true-M is wasted MMA work. See
+// mxfp8_perf_README.md "Tile-shape selection strategy". K_TILE=64 is fixed:
+// SG_K>=32 and 2 K-slices per iteration are required by the mainloop.
+// K_TILE=128 was tried (2026-08-25); AubLoad rc=12 mid-kernel on the sim,
+// suspected untested SG_K=128 corner in CUTLASS-Xe. Reverted to 64.
+using MXFP8Types_decode = BlockScaledMoETypes<
+    typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
+    cute::Stride<cute::_1, int64_t, int64_t>,
+    cute::Int<32>,
+    Shape<_128, _256, _64>,
+    32>;
 
-using MXFP8Runner = BlockScaledGroupedGemmRunner<MXFP8Types>;
+using MXFP8Types_step = BlockScaledMoETypes<
+    typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
+    cute::Stride<cute::_1, int64_t, int64_t>,
+    cute::Int<32>,
+    Shape<_256, _256, _64>,
+    32>;
+
+using MXFP8Types_prefill = BlockScaledMoETypes<
+    typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
+    cute::Stride<cute::_1, int64_t, int64_t>,
+    cute::Int<32>,
+    Shape<_512, _512, _64>,
+    32>;
+
+using MXFP8Runner_decode  = BlockScaledGroupedGemmRunner<MXFP8Types_decode>;
+using MXFP8Runner_step    = BlockScaledGroupedGemmRunner<MXFP8Types_step>;
+using MXFP8Runner_prefill = BlockScaledGroupedGemmRunner<MXFP8Types_prefill>;
+using MXFP8Types = MXFP8Types_step;
 
 }  // namespace at::native::xpu
 
@@ -339,20 +383,64 @@ void fp8_blockwise_scaled_grouped_mm(
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
 
+  // Threaded into the runner so it skips its own D->H sync of problem_sizes.
+  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
+  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
+  const int E_ = static_cast<int>(problem_sizes_host.size(0));
+  int max_m = 0;
+  for (int e = 0; e < E_; ++e) {
+    const int m_e = psz[e * 3 + 0];
+    if (m_e > max_m) max_m = m_e;
+  }
+
   if (is_mxfp8) {
-    at::native::xpu::MXFP8Runner::run(
-        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-        a, b,
-        need_prep ? scales_a_t_keep_alive : scales_a,
-        need_prep ? scales_b_t_keep_alive : scales_b,
-        problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override);
+    if (max_m <= 32) {
+      at::native::xpu::MXFP8Runner_decode::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          need_prep ? scales_b_t_keep_alive : scales_b,
+          problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    } else if (max_m <= 512) {
+      at::native::xpu::MXFP8Runner_step::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          need_prep ? scales_b_t_keep_alive : scales_b,
+          problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    } else {
+      at::native::xpu::MXFP8Runner_prefill::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          need_prep ? scales_b_t_keep_alive : scales_b,
+          problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    }
   } else {
-    at::native::xpu::FP8Runner::run(
-        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-        a, b,
-        need_prep ? scales_a_t_keep_alive : scales_a,
-        scales_b, problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override);
+    if (max_m <= 32) {
+      at::native::xpu::FP8Runner_decode::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          scales_b, problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    } else if (max_m <= 512) {
+      at::native::xpu::FP8Runner_step::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          scales_b, problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    } else {
+      at::native::xpu::FP8Runner_prefill::run(
+          output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+          a, b,
+          need_prep ? scales_a_t_keep_alive : scales_a,
+          scales_b, problem_sizes, expert_offsets, workspace,
+          sa_m_stride_override, &problem_sizes_host);
+    }
   }
 }

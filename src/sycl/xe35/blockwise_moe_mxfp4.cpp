@@ -25,8 +25,9 @@ using namespace cutlass::gemm;
 
 namespace at::native::xpu {
 
-// MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides
-struct MXFP4Types {
+// MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides.
+template <class TileShape_>
+struct MXFP4TypesT {
 
   using ElementType     = cutlass::mx_float4_t<float_e2m1_t>;
   using ElementInputA   = typename ElementType::DataType;    // float_e2m1_t
@@ -50,7 +51,6 @@ struct MXFP4Types {
 
 
   static constexpr int BlockSize = 32;
-  static constexpr int TileK     = 64;
 
   // Void selects CUTLASS's block-2D auto-detection path.
   using GmemTiledCopyA      = void;
@@ -58,7 +58,7 @@ struct MXFP4Types {
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  using TileShape = Shape<_512, _512, Int<TileK>>;
+  using TileShape = TileShape_;
 
   // Thread layout (8×4 SG tiling, n-major)
   using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
@@ -124,7 +124,17 @@ struct MXFP4Types {
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 };
 
-using MXFP4Runner = BlockScaledGroupedGemmRunner<MXFP4Types>;
+// Tile-bucket dispatch mirrors MXFP8; N_TILE=512 works here because 4-bit A/B
+// packing halves per-stage L1 pressure vs MXFP8. K_TILE=64 fixed (SG_K>=32,
+// mainloop needs 2 K-slices).
+using MXFP4Types_decode  = MXFP4TypesT<Shape<_128, _512, _64>>;
+using MXFP4Types_step    = MXFP4TypesT<Shape<_256, _512, _64>>;
+using MXFP4Types_prefill = MXFP4TypesT<Shape<_512, _512, _64>>;
+
+using MXFP4Runner_decode  = BlockScaledGroupedGemmRunner<MXFP4Types_decode>;
+using MXFP4Runner_step    = BlockScaledGroupedGemmRunner<MXFP4Types_step>;
+using MXFP4Runner_prefill = BlockScaledGroupedGemmRunner<MXFP4Types_prefill>;
+using MXFP4Types = MXFP4Types_step;
 
 }  // namespace at::native::xpu
 
@@ -165,6 +175,15 @@ void mxfp4_blockwise_scaled_grouped_mm(
 
   const bool need_prep = (a_ptrs.numel() == 0);
 
+  // Threaded into the runner so it skips its own D->H sync of problem_sizes.
+  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
+  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
+  const int E = static_cast<int>(problem_sizes_host.size(0));
+  int max_m = 0;
+  for (int e = 0; e < E; ++e) {
+    if (psz[e * 3] > max_m) max_m = psz[e * 3];
+  }
+
   if (need_prep) {
     TORCH_CHECK(a.dim() == 2,
                 "On-device prep requires flat 2D A (sum_m_i, K/2), got ", a.dim(), " dimensions");
@@ -180,7 +199,8 @@ void mxfp4_blockwise_scaled_grouped_mm(
                 "On-device prep requires all ptr-array tensors to be empty");
 
     constexpr int BS = at::native::xpu::MXFP4Types::BlockSize;
-    const int E = static_cast<int>(expert_offsets.size(0));
+    TORCH_CHECK(expert_offsets.size(0) == E,
+                "expert_offsets and problem_sizes disagree on num_experts");
     const int packed_K = static_cast<int>(a.size(1));   // K/2
     const int K = packed_K * 2;
     const int N = static_cast<int>(output.size(1));
@@ -202,15 +222,6 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const int64_t o_elem  = output.element_size();
     const int64_t sa_elem = scales_a.element_size();
     const int64_t sb_elem = scales_b.element_size();
-
-    // max_m_i drives the padded A-scales scratch.
-    auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
-    const int32_t* psz = problem_sizes_cpu.data_ptr<int32_t>();
-    int max_m = 0;
-    for (int e = 0; e < E; ++e) {
-      if (psz[e * 3] > max_m) max_m = psz[e * 3];
-    }
-    TORCH_CHECK(max_m > 0, "max_m must be positive across experts");
 
     scales_a_t_keep_alive = torch::empty({E, scale_cols, max_m}, opts_u8);
     scales_b_t_keep_alive = torch::empty({E, scale_cols, N}, opts_u8);
@@ -247,11 +258,32 @@ void mxfp4_blockwise_scaled_grouped_mm(
   // Padded A-scales -> override M-stride to max_m; legacy path uses m_i.
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
-  at::native::xpu::MXFP4Runner::run(
-      output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-      a, b,
-      need_prep ? scales_a_t_keep_alive : scales_a,
-      need_prep ? scales_b_t_keep_alive : scales_b,
-      problem_sizes, expert_offsets, workspace,
-      sa_m_stride_override);
+
+  TORCH_CHECK(max_m > 0, "problem_sizes[:, 0] must contain at least one positive M");
+
+  if (max_m <= 32) {
+    at::native::xpu::MXFP4Runner_decode::run(
+        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+        a, b,
+        need_prep ? scales_a_t_keep_alive : scales_a,
+        need_prep ? scales_b_t_keep_alive : scales_b,
+        problem_sizes, expert_offsets, workspace,
+        sa_m_stride_override, &problem_sizes_host);
+  } else if (max_m <= 512) {
+    at::native::xpu::MXFP4Runner_step::run(
+        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+        a, b,
+        need_prep ? scales_a_t_keep_alive : scales_a,
+        need_prep ? scales_b_t_keep_alive : scales_b,
+        problem_sizes, expert_offsets, workspace,
+        sa_m_stride_override, &problem_sizes_host);
+  } else {
+    at::native::xpu::MXFP4Runner_prefill::run(
+        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+        a, b,
+        need_prep ? scales_a_t_keep_alive : scales_a,
+        need_prep ? scales_b_t_keep_alive : scales_b,
+        problem_sizes, expert_offsets, workspace,
+        sa_m_stride_override, &problem_sizes_host);
+  }
 }
